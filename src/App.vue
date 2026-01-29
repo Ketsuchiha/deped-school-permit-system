@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue'
-import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle } from 'lucide-vue-next'
+import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard } from 'lucide-vue-next'
 import Tesseract from 'tesseract.js'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
@@ -12,6 +12,41 @@ GlobalWorkerOptions.workerSrc = workerSrc
 const currentView = ref('search') // 'search' | 'admin'
 
 const API_URL = 'http://localhost:3000/api'
+
+const showSummary = ref(false)
+
+const summaryStats = computed(() => {
+  const totalSchools = schools.value.length
+  const totalPermits = permits.value.length
+  
+  // Breakdown by level (Permits can have multiple levels)
+  const levels = {
+    'Kindergarten': 0,
+    'Elementary': 0,
+    'Junior High School': 0,
+    'Senior High School': 0
+  }
+  
+  permits.value.forEach(p => {
+    // Parse level string "Kindergarten, Elementary"
+    const pLevels = (p.level || '').split(',').map(l => l.trim())
+    pLevels.forEach(l => {
+      if (levels[l] !== undefined) levels[l]++
+    })
+  })
+  
+  // Recent Permits (Last 5)
+  const recentPermits = [...permits.value].sort((a, b) => {
+    // Sort by ID assuming chronological or add date field later. 
+    // For now, reverse order of array (newest last usually) or use ID timestamp if possible
+    return b.id.localeCompare(a.id) 
+  }).slice(0, 5).map(p => {
+    const s = schools.value.find(sc => sc.id === p.school_id)
+    return { ...p, schoolName: s ? s.name : 'Unknown' }
+  })
+
+  return { totalSchools, totalPermits, levels, recentPermits }
+})
 
 // ─── Data: schools (create first) and permits ───────────────────────────────
 const schools = ref([])
@@ -58,18 +93,256 @@ const schoolForm = ref({
   name: '',
   type: 'Private', // Default to Private
   address: '',
+  fileName: '',
+  file: null, // For OCR upload
+  filePreviewUrl: null,
+  ocrLoading: false,
+  // Combined Flow Fields
+  levels: [],
+  schoolYear: '',
+  permitNumber: '',
+  strands: [],
+  extractedText: '',
+  detectedPermits: [] // Array of { permitNumber, schoolYear, levels, strands }
 })
 const schoolFormErrors = ref({})
 const createTab = ref('school') // 'school' | 'homeschool'
 
+async function onSchoolFileChange(e) {
+  const file = e.target.files?.[0]
+  if (!file) return
+  
+  if (schoolForm.value.filePreviewUrl) URL.revokeObjectURL(schoolForm.value.filePreviewUrl)
+  schoolForm.value.file = file
+  schoolForm.value.filePreviewUrl = URL.createObjectURL(file)
+  schoolForm.value.fileName = file.name
+  schoolForm.value.ocrLoading = true
+  
+  try {
+    let text = ''
+    if (file.type.startsWith('image/')) {
+      const { data } = await Tesseract.recognize(file, 'eng')
+      text = data.text
+    } else if (file.type === 'application/pdf') {
+       // Robust PDF text extract
+       const buf = await file.arrayBuffer()
+       const pdf = await getDocument({ data: buf }).promise
+       
+       const maxPages = Math.min(pdf.numPages, 10) // Increased to 10 to catch multiple permits
+       for (let i = 1; i <= maxPages; i++) {
+         const page = await pdf.getPage(i)
+         const content = await page.getTextContent()
+         let pageText = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
+         
+         // If text is too sparse, try OCR on the page (scanned PDF)
+         if (pageText.replace(/\s/g, '').length < 50) {
+            try {
+              const viewport = page.getViewport({ scale: 2.0 })
+              const canvas = document.createElement('canvas')
+              const context = canvas.getContext('2d')
+              canvas.height = viewport.height
+              canvas.width = viewport.width
+              await page.render({ canvasContext: context, viewport: viewport }).promise
+              const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))
+              const { data } = await Tesseract.recognize(blob, 'eng')
+              pageText = data.text
+            } catch (ocrErr) {
+              console.error('Page OCR failed:', ocrErr)
+            }
+         }
+         text += pageText + ' '
+       }
+    }
+    
+    schoolForm.value.extractedText = text
+
+    // Block signatures (Clean text)
+    const signatureMarkers = [
+      /Approved\s+by:/i,
+      /Signed\s+by:/i,
+      /Recommending\s+Approval:/i,
+      /By\s+Authority\s+of\s+the\s+Secretary:/i,
+      /Schools\s+Division\s+Superintendent/i,
+      /Regional\s+Director/i,
+      /Digitally\s+signed/i
+    ]
+    let cleanTextForName = text
+    for (const marker of signatureMarkers) {
+      const match = cleanTextForName.match(marker)
+      if (match) {
+         cleanTextForName = cleanTextForName.substring(0, match.index).trim()
+         break 
+      }
+    }
+
+    // Extract School Name & Address
+    const lines = cleanTextForName.split('\n').map(l => l.trim()).filter(l => l)
+    
+    // Find School Name
+    const schoolKeywords = ['School', 'Academy', 'College', 'Institute', 'University', 'Montessori', 'Learning Center']
+    let foundName = ''
+    
+    // Strategy 1: Explicit labels
+    for (let i = 0; i < lines.length - 1; i++) {
+       const nextLine = lines[i+1].toLowerCase().replace(/\s/g, '')
+       if (nextLine.includes('(school)') || nextLine.includes('(nameofschool)')) {
+          foundName = lines[i]
+          break
+       }
+    }
+
+    if (!foundName) {
+      const grantMatch = text.match(/(?:hereby\s+)?granted\s+to\s+([A-Z\s.,&'-]+?)(?:\s+to\s+operate|\s*located)/i)
+      const theMatch = text.match(/The\s+([A-Z\s.,&'-]+?)\s+located\s+at/i)
+      const explicitNameMatch = text.match(/(?:Name\s+of\s+School|School\s+Name)\s*[:.]?\s*([A-Z\s.,&'-]+)/i)
+
+      if (grantMatch && grantMatch[1]) {
+         foundName = grantMatch[1].trim()
+      } else if (theMatch && theMatch[1]) {
+         foundName = theMatch[1].trim()
+      } else if (explicitNameMatch && explicitNameMatch[1]) {
+         foundName = explicitNameMatch[1].trim()
+      } else {
+         const endorsementLine = lines.find(l => l.match(/Respectfully\s+endorsed\s+to/i))
+         if (endorsementLine) {
+            const match = endorsementLine.match(/(?:Administrator|Principal|Head|Director)\s+of\s+(?:the\s+)?(.*)/i)
+            if (match && match[1]) {
+               foundName = match[1].trim()
+            } else {
+               foundName = endorsementLine
+            }
+         } else {
+             // Fallback: Only accept if it looks very much like a school name and isn't a header
+             for (const line of lines) {
+               if (line.match(/^(Respectfully|This\s+permit|Pursuant|Republic|Department|Region|Division|Office)/i)) continue
+               // Must contain a keyword AND not be a sentence
+               if (schoolKeywords.some(k => line.includes(k)) && line.length < 80 && !line.includes('...')) {
+                  // Additional check: Should not start with "To:" or "From:"
+                  if (/^(To|From|Subject|Attention):/i.test(line)) continue
+                  
+                  foundName = line
+                  break
+               }
+             }
+         }
+      }
+    }
+    
+    if (foundName) {
+      const prefixMatch = foundName.match(/(?:Administrator|Principal|Head|Director)\s+of\s+(?:the\s+)?(.*)/i)
+      if (prefixMatch && prefixMatch[1]) foundName = prefixMatch[1].trim()
+      foundName = foundName.replace(/^Respectfully\s+endorsed\s+to\s+/i, '')
+      foundName = foundName.replace(/[,.]+$/, '')
+    }
+    
+    // Find Address (Refined for "City, Province" without unnecessary words)
+    let foundAddress = ''
+    
+    // Strategy 1: Explicit labels
+    for (let i = 0; i < lines.length - 1; i++) {
+       const nextLine = lines[i+1].toLowerCase().replace(/\s/g, '')
+       if (nextLine.includes('(completeaddress)') || nextLine.includes('(address)')) {
+          foundAddress = lines[i]
+          break
+       }
+    }
+
+    if (!foundAddress) {
+      // Look for line ending with "City" or "Province" or typical address format
+      // Exclude headers starting with Department, Republic, Region, Division
+      const addressBlockList = /^(Department|Republic|Region|Division|Office|District|Subject|To:|From:)/i
+      
+      // Strategy 2: Scan lines for City/Province
+      for (const line of lines) {
+        if (line.includes(foundName)) continue
+        if (addressBlockList.test(line)) continue
+        if (line.match(/^Respectfully\s+endorsed/i)) continue
+        
+        // Check for City/Province presence
+        // Ensure it's not just "City Schools Division" or "Division of City"
+        const hasCity = /\bCity\b/.test(line) && !/City\s+Schools\s+Division/i.test(line) && !/Division\s+of/i.test(line)
+        const hasProvince = /\bProvince\b/.test(line) && !/Province\s+of/i.test(line) // Avoid "Province of Laguna" header alone if possible, though usually address includes it.
+        const hasStreet = /\bSt\.\s/.test(line) || line.includes('Street') || line.includes('Subd') || line.includes('Brgy') || line.includes('Barangay')
+        
+        if (hasCity || hasProvince || hasStreet) {
+           // Clean up unnecessary words if present
+           let cleaned = line.replace(/^(located at|address[:.]?)\s*/i, '')
+           
+           // Truncate text that looks like the start of a sentence or legal clause
+           // Matches "... City, Laguna, approving the herein..." -> "... City, Laguna"
+           const stopWordsRegex = /[,.]?\s+(approving|approves|granting|granted|hereby|which|where|to\s+operate|is\s+located|subject\s+to|pursuant|under|following|endorsed|indorsed|recommending)\b/i
+           const stopMatch = cleaned.match(stopWordsRegex)
+           if (stopMatch) {
+              cleaned = cleaned.substring(0, stopMatch.index).trim()
+           }
+
+           // Remove trailing punctuation
+           cleaned = cleaned.replace(/[.,;:]+$/, '')
+
+           // If it looks like a valid address (has numbers or multiple words)
+           if (cleaned.split(' ').length > 2) {
+              foundAddress = cleaned
+              break
+           }
+        }
+      }
+    }
+    
+    if (foundName) schoolForm.value.name = foundName
+    if (foundAddress) schoolForm.value.address = foundAddress
+
+    // ─── Unified Flow: Extract Multiple Permits ───
+    const extractedPermits = extractPermitDetails(text)
+    if (extractedPermits.length > 0) {
+      schoolForm.value.detectedPermits = extractedPermits
+      
+      // Auto-fill the first permit found to Streamline Registration
+      const p = extractedPermits[0]
+      schoolForm.value.permitNumber = p.permitNumber
+      schoolForm.value.schoolYear = p.schoolYear
+      schoolForm.value.levels = [...new Set([...schoolForm.value.levels, ...p.levels])] // Merge levels
+      if (p.strands && p.strands.length > 0) {
+         schoolForm.value.strands = [...new Set([...schoolForm.value.strands, ...p.strands])]
+      }
+
+      showToast(`Detected ${extractedPermits.length} permit(s). Auto-filled details.`, 'success')
+    } else {
+      schoolForm.value.detectedPermits = []
+      showToast('School info scanned. No permits detected.', 'info')
+    }
+
+  } catch (err) {
+    console.error(err)
+    showToast('Failed to scan file', 'error')
+  } finally {
+    schoolForm.value.ocrLoading = false
+  }
+}
+
 function setCreateTab(tab) {
   createTab.value = tab
   schoolFormErrors.value = {}
+  
+  const commonFields = {
+    name: '',
+    address: '',
+    file: null,
+    fileName: '',
+    filePreviewUrl: null,
+    ocrLoading: false,
+    levels: [],
+    schoolYear: '',
+    permitNumber: '',
+    strands: [],
+    extractedText: '',
+    detectedPermits: []
+  }
+
   if (tab === 'homeschool') {
-    schoolForm.value = { name: '', type: 'Homeschooling', address: '' }
+    schoolForm.value = { ...commonFields, type: 'Homeschooling' }
     setManageTab('application')
   } else {
-    schoolForm.value = { name: '', type: 'Private', address: '' } // Default to Private
+    schoolForm.value = { ...commonFields, type: 'Private' }
     setManageTab('permit')
   }
 }
@@ -135,10 +408,65 @@ async function createSchool() {
     if (res.ok) {
       const savedSchool = await res.json()
       schools.value.push(savedSchool)
-      // Reset form, keep type default
-      schoolForm.value = { name: '', type: 'Private', address: '' }
+      
+      // ─── Unified Flow: Create Permit if details are present ───
+      // Only if Permit Number and School Year are detected/entered
+      if (schoolForm.value.permitNumber && schoolForm.value.schoolYear && schoolForm.value.levels.length > 0) {
+         try {
+           const formData = new FormData()
+           formData.append('id', crypto.randomUUID?.() ?? Date.now().toString(36))
+           formData.append('schoolId', savedSchool.id)
+           formData.append('levels', JSON.stringify(schoolForm.value.levels))
+           formData.append('schoolYear', schoolForm.value.schoolYear)
+           formData.append('permitNumber', schoolForm.value.permitNumber)
+           formData.append('extractedText', schoolForm.value.extractedText || '')
+           
+           if (schoolForm.value.levels.includes('Senior High School') && schoolForm.value.strands?.length) {
+              formData.append('strands', JSON.stringify(schoolForm.value.strands))
+           }
+           
+           if (schoolForm.value.file) {
+              formData.append('file', schoolForm.value.file)
+           }
+           
+           const permitRes = await fetch(`${API_URL}/permits`, {
+              method: 'POST',
+              body: formData
+           })
+           
+           if (permitRes.ok) {
+              const savedPermit = await permitRes.json()
+              permits.value.push(savedPermit)
+              showToast('School and Permit created successfully!', 'success')
+           } else {
+              showToast('School created, but failed to create permit', 'error')
+           }
+         } catch (pErr) {
+            console.error('Permit creation failed', pErr)
+            showToast('School created, but failed to create permit', 'error')
+         }
+      } else {
+         showToast('School created successfully!', 'success')
+      }
+
+      // Reset form, keep current type based on tab
+      schoolForm.value = { 
+        name: '', 
+        type: createTab.value === 'homeschool' ? 'Homeschooling' : 'Private', 
+        address: '', 
+        levels: [], 
+        schoolYear: '', 
+        permitNumber: '', 
+        strands: [], 
+        extractedText: '',
+        file: null,
+        fileName: '',
+        filePreviewUrl: null,
+        ocrLoading: false,
+        detectedPermits: []
+      }
       schoolFormErrors.value = {}
-      showToast('School created successfully!', 'success')
+      
     } else {
       const errData = await res.json().catch(() => ({}))
       throw new Error(errData.error || 'Failed to create school')
@@ -180,150 +508,122 @@ function showToast(message, type = 'success') {
   }, 3000)
 }
 
-/** Extract permit number and school year from OCR text */
+/** Extract multiple permit details from OCR text */
 function extractPermitDetails(text) {
-  if (!text || !text.trim()) return { permitNumber: '', schoolYear: '', levels: [] }
+  if (!text || !text.trim()) return []
   
   const t = text.replace(/\s+/g, ' ').trim()
-  let permitNumber = ''
-  let schoolYear = ''
-  const detectedLevels = new Set()
+  const permits = []
 
-  // 1. Detect Levels based on prefixes (K, E, S, SHS, JHS) and Explicit Text
-  
-  // Explicit Text Detection (Prioritized)
-  const hasKindergarten = /Kindergarten/i.test(t)
-  const hasElementary = /Elementary/i.test(t)
-  const hasJuniorHigh = /Junior\s*High\s*School/i.test(t)
-  const hasSeniorHigh = /Senior\s*High\s*School/i.test(t)
-
-  // Prefix checks
-  if (/K\s*[-–]\s*\d+/i.test(t) || hasKindergarten) detectedLevels.add('Kindergarten')
-  if (/E\s*[-–]\s*\d+/i.test(t) || hasElementary) detectedLevels.add('Elementary')
-  
-  // Check for JHS/SHS/S
-  if (/JHS\s*[-–]\s*\d+/i.test(t) || hasJuniorHigh) detectedLevels.add('Junior High School')
-  if (/SHS\s*[-–]\s*\d+/i.test(t) || hasSeniorHigh) detectedLevels.add('Senior High School')
-  
-  // "S" for Junior High School (as per user request)
-  // Only add if we don't already have specific JHS/SHS info, OR if it's explicitly JHS
-  // Actually user said S -> Junior High.
-  if (/S(?!H)\s*[-–]\s*\d+/i.test(t)) {
-     detectedLevels.add('Junior High School')
+  // Helper: Detect Strands (Full names & Abbreviations)
+  const detectStrands = (txt) => {
+    const found = []
+    // STEM
+    if (/STEM|Science,? Technology,? Engineering,? (?:and|&) Mathematics/i.test(txt)) found.push('STEM')
+    // ABM
+    if (/ABM|Accountancy,? Business,? (?:and|&) Management/i.test(txt)) found.push('ABM')
+    // HUMSS
+    if (/HUMSS|Humanities (?:and|&) Social Sciences/i.test(txt)) found.push('HUMSS')
+    // GAS
+    if (/GAS|General Academic/i.test(txt)) found.push('GAS')
+    // TVL
+    if (/TVL|Technical[- ]Vocational[- ]Livelihood/i.test(txt)) found.push('TVL')
+    // Sports
+    if (/Sports/i.test(txt)) found.push('Sports')
+    // Arts and Design
+    if (/Arts (?:and|&) Design/i.test(txt)) found.push('Arts and Design')
+    return found
   }
-
-  // Refinement: If "Senior High School" is explicitly mentioned but "Junior High School" is NOT,
-  // ensure we didn't accidentally add Junior High due to ambiguous "S" or "High School" matches.
-  if (hasSeniorHigh && !hasJuniorHigh) {
-    detectedLevels.delete('Junior High School')
-  }
-  // Conversely, if JHS is explicit and SHS is not
-  if (hasJuniorHigh && !hasSeniorHigh) {
-    detectedLevels.delete('Senior High School')
-  }
-
-  // 2. Extract Permit Number(s)
-  // Collect all valid permit numbers found to populate the field
-  const foundPermits = []
   
-  // Priority patterns for extraction
-  const specificPatterns = [
-    // /(DEPED\s*[-–]\s*[A-Z0-9]+[-–][A-Z0-9-]{5,})/gi, // REMOVED per user request (only K, E, S, SHS)
-    /(SHS\s*-\s*\d+)/gi,
-    /(JHS\s*-\s*\d+)/gi,
-    /(K\s*-\s*\d+)/gi,
-    /(E\s*-\s*\d+)/gi,
-    /(S\s*-\s*\d+)/gi, // Generic S-
-    /No\.?\s*([A-Z]+-[0-9]+)/gi, // Generic No. XXX-000
-  ]
+  // Strict Government Permit Pattern
+  // Matches: "Government Permit (Region IV-A) No. K-123 s. 2024" or "GP No. 123 s. 2023"
+  const gpRegex = /(?:Government\s+Permit|GP)(?:\s+\(Region\s+[IVX\d\w-]+\))?\s+No\.?\s*([A-Z0-9-]+)\s*s\.?\s*(\d{4})/gi
   
-  // Try to find specific coded permits first
-  for (const re of specificPatterns) {
-    const matches = t.match(re)
-    if (matches) {
-      matches.forEach(m => foundPermits.push(m.trim()))
-    }
-  }
-
-  // If no specific codes found, fallback to generic patterns
-  if (foundPermits.length === 0) {
-    const genericPatterns = [
-        /Government\s*Permit\s*(?:\(.*\))?\s*No\.?\s*[._\-\s]*([A-Z0-9-]+)/i,
-        /No\.?\s*[._\-\s]*([A-Z0-9-]+)/i,
-        /Permit\s*No\.?\s*[._\-\s]*([A-Z0-9-]+)/i,
-        /Permit\s*(?:#|number)?\s*:?\s*[._\-\s]*([A-Z0-9-]+)/i,
-        /([A-Z]{1,3}\s*-\s*\d+)/i, 
-    ]
+  let match
+  while ((match = gpRegex.exec(t)) !== null) {
+    const pNum = match[1].trim()
+    const sYear = match[2].trim()
     
-    for (const re of genericPatterns) {
-        const m = t.match(re)
-        if (m && m[1]) {
-            foundPermits.push(m[1].trim())
-            break // Just take the first good generic match
-        }
+    // Infer Level from Permit Number Prefix
+    const levels = []
+    let strands = []
+    
+    if (/^K-/i.test(pNum)) levels.push('Kindergarten')
+    else if (/^E-/i.test(pNum)) levels.push('Elementary')
+    else if (/^JHS-/i.test(pNum) || /^S-/i.test(pNum)) levels.push('Junior High School')
+    else if (/^SHS-/i.test(pNum)) {
+      levels.push('Senior High School')
     }
-  }
+    
+    // If no prefix match, try to look at context around the match (e.g. 100 chars before)
+    if (levels.length === 0) {
+       const context = t.substring(Math.max(0, match.index - 200), match.index + 100)
+       if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
+       if (/Elementary/i.test(context)) levels.push('Elementary')
+       if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
+       if (/Senior\s*High/i.test(context)) levels.push('Senior High School')
+    }
 
-  // Deduplicate found permits
-  permitNumber = [...new Set(foundPermits)]
-    .filter(p => {
-      const up = p.toUpperCase()
-      if (up.startsWith('DEPED')) return false // Explicit exclude
-      // Strict whitelist: K, E, S (includes SHS), J (includes JHS)
-      return /^(K|E|S|J)/.test(up)
+    // Detect Strands if SHS is involved
+    if (levels.includes('Senior High School')) {
+       strands = detectStrands(t)
+    }
+
+    permits.push({
+      permitNumber: pNum,
+      schoolYear: sYear,
+      levels: levels,
+      strands: strands
     })
-    .join(', ')
-
-  // 3. Extract Year / Series
-  // Priority: "s. 2018"
-  const yearPatterns = [
-    /s\.?\s*(20\d{2})/i,             // Matches "s. 2018" (Strictly 2000+)
-    /series\s*of\s*(20\d{2})/i,      // Matches "series of 2018" (Strictly 2000+)
-    /SY\s*(20\d{2}-\d{4})/i,         // Matches "SY 2018-2019"
-    /School\s*Year\s*.*(20\d{2}\s*-\s*20\d{2})/i, // Flexible: "School Year _____ 2018-2019", strictly 2000+
-    /(20\d{2})\s*-\s*(20\d{2})/,   // Matches "2018-2019" (Strictly 2000+)
-  ]
-
-  for (const re of yearPatterns) {
-    const m = t.match(re)
-    if (m && m[1]) {
-      // If we matched a full range like "2018-2019"
-      if (m[1].length === 9 && m[1].includes('-')) {
-        schoolYear = m[1].trim()
-      } else if (m[2]) {
-         // Matches "2018 - 2019" -> "2018-2019"
-         schoolYear = `${m[1]}-${m[2]}`
-      } else if (m[1].length === 4) {
-        // Matches "2018" -> Convert to "2018-2019"
-        const y = parseInt(m[1], 10)
-        schoolYear = `${y}-${y + 1}`
-      }
-      break
-    }
   }
 
-  // 4. Extract Strands (Only if Senior High School is detected/relevant)
-  const detectedStrands = new Set()
-  // Keywords for strands
-  const strandKeywords = [
-    { code: 'STEM', patterns: [/STEM/i, /Science\s*Technology\s*Engineering\s*(?:and)?\s*Mathematics/i] },
-    { code: 'ABM', patterns: [/ABM/i, /Accountancy\s*Business\s*(?:and)?\s*Management/i] },
-    { code: 'HUMSS', patterns: [/HUMSS/i, /Humanities\s*(?:and)?\s*Social\s*Sciences/i] },
-    { code: 'GAS', patterns: [/GAS/i, /General\s*Academic\s*Strand/i] },
-    { code: 'TVL', patterns: [/TVL/i, /Technical\s*Vocational\s*Livelihood/i] },
-    { code: 'Arts and Design', patterns: [/Arts\s*(?:and)?\s*Design/i] },
-    { code: 'Sports', patterns: [/Sports\s*Track/i] }
-  ]
+  // Fallback: If no strict "Government Permit" found, try looser extraction for single permit
+  if (permits.length === 0) {
+      // Use previous logic but stricter
+      const loosePermits = []
+      
+      // Look for standalone permit numbers with prefixes
+      const patterns = [
+        { regex: /(SHS\s*-\s*\d+)/i, level: 'Senior High School' },
+        { regex: /(JHS\s*-\s*\d+)/i, level: 'Junior High School' },
+        { regex: /(K\s*-\s*\d+)/i, level: 'Kindergarten' },
+        { regex: /(E\s*-\s*\d+)/i, level: 'Elementary' }
+      ]
+      
+      // Look for School Year
+      const syMatch = t.match(/s\.?\s*(\d{4})/i) || t.match(/(\d{4})\s*[-–]\s*(\d{4})/i)
+      const foundYear = syMatch ? (syMatch[2] ? `${syMatch[1]}-${syMatch[2]}` : syMatch[1]) : ''
+      
+      for (const p of patterns) {
+         const m = t.match(p.regex)
+         if (m) {
+            let strands = []
+            if (p.level === 'Senior High School') {
+               strands = detectStrands(t)
+            }
 
-  // Only scan for strands if SHS is likely or explicitly checked
-  // (We'll just scan anyway and let the UI decide to show it if SHS is picked)
-  strandKeywords.forEach(strand => {
-    if (strand.patterns.some(p => p.test(t))) {
-      detectedStrands.add(strand.code)
-    }
-  })
-
-  return { permitNumber, schoolYear, levels: Array.from(detectedLevels), strands: Array.from(detectedStrands) }
+            loosePermits.push({
+               permitNumber: m[1].replace(/\s/g, ''),
+               schoolYear: foundYear,
+               levels: [p.level],
+               strands: strands
+            })
+         }
+      }
+      
+      // Deduplicate by permitNumber
+      const unique = []
+      const seen = new Set()
+      for (const p of loosePermits) {
+        if (!seen.has(p.permitNumber)) {
+          seen.add(p.permitNumber)
+          unique.push(p)
+        }
+      }
+      return unique
+  }
+  
+  return permits
 }
 
 async function onPermitFileChange(e) {
@@ -336,81 +636,67 @@ async function onPermitFileChange(e) {
   permitFormErrors.value.upload = null
   permitForm.value.permitNumber = ''
   permitForm.value.extractedText = ''
-  // Don't clear schoolYear immediately, wait for OCR to potentially overwrite it
   
   ocrLoading.value = true
   try {
-    let extracted = { permitNumber: '', schoolYear: '' }
+    let extractedPermits = []
     let fullText = ''
     
     if (file.type.startsWith('image/')) {
       const { data } = await Tesseract.recognize(file, 'eng')
       fullText = data.text
-      extracted = extractPermitDetails(fullText)
+      extractedPermits = extractPermitDetails(fullText)
     } else if (file.type === 'application/pdf') {
       const buf = await file.arrayBuffer()
       const pdf = await getDocument({ data: buf }).promise
       
-      // Scan up to 50 pages (effectively whole document for most permits)
       const maxPages = Math.min(pdf.numPages, 50)
       for (let i = 1; i <= maxPages; i++) {
         const page = await pdf.getPage(i)
-        
-        // Try text content first (fastest)
         const content = await page.getTextContent()
         let pageText = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
         
-        // If text content is sparse (likely scanned PDF), render to image and OCR
         if (pageText.replace(/\s/g, '').length < 50) {
            try {
-             const viewport = page.getViewport({ scale: 2.0 }) // Higher scale for better OCR
+             const viewport = page.getViewport({ scale: 2.0 })
              const canvas = document.createElement('canvas')
              const context = canvas.getContext('2d')
              canvas.height = viewport.height
              canvas.width = viewport.width
-             
              await page.render({ canvasContext: context, viewport: viewport }).promise
-             
-             // Convert to blob/url for Tesseract
              const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))
              const { data } = await Tesseract.recognize(blob, 'eng')
              pageText = data.text
            } catch (ocrErr) {
              console.error('Page OCR failed:', ocrErr)
-             // fallback to whatever text we had
            }
         }
-        
         fullText += pageText + ' '
       }
-      extracted = extractPermitDetails(fullText)
+      extractedPermits = extractPermitDetails(fullText)
     }
 
     permitForm.value.extractedText = fullText
 
-    if (extracted.permitNumber) {
-      permitForm.value.permitNumber = extracted.permitNumber
-    }
-    if (extracted.schoolYear) {
-      permitForm.value.schoolYear = extracted.schoolYear
-    }
-    
-    if (extracted.levels && extracted.levels.length > 0) {
-      const currentLevels = new Set(permitForm.value.levels)
-      extracted.levels.forEach(l => currentLevels.add(l))
-      permitForm.value.levels = Array.from(currentLevels)
-      showToast(`Detected levels: ${extracted.levels.join(', ')}`, 'success')
-    }
-
-    if (extracted.strands && extracted.strands.length > 0) {
-      // Merge detected strands
-      const currentStrands = new Set(permitForm.value.strands)
-      extracted.strands.forEach(s => currentStrands.add(s))
-      permitForm.value.strands = Array.from(currentStrands)
-      // Note: Strands UI is only visible if Senior High School level is also detected/selected
+    // Handle the first detected permit for the Permit Upload form
+    // (User can manually adjust if multiple are found, but this form is usually for one)
+    if (extractedPermits.length > 0) {
+       const p = extractedPermits[0]
+       permitForm.value.permitNumber = p.permitNumber
+       permitForm.value.schoolYear = p.schoolYear
+       permitForm.value.levels = p.levels
+       permitForm.value.strands = p.strands
+       
+       if (extractedPermits.length > 1) {
+          showToast(`Detected ${extractedPermits.length} permits. Using the first one (${p.permitNumber}).`, 'info')
+       } else {
+          showToast('Permit details scanned successfully', 'success')
+       }
+    } else {
+       showToast('No specific Government Permit details found', 'info')
     }
     
-    // Check school name match immediately if school is selected
+    // Check school name match
     if (permitForm.value.schoolId) {
       const schoolName = getSchoolName(permitForm.value.schoolId)
       const match = checkSchoolNameMatch(fullText, schoolName)
@@ -422,7 +708,7 @@ async function onPermitFileChange(e) {
     }
     
   } catch (_) {
-    // OCR failed, keep manual entry possible
+    console.error(_)
   } finally {
     ocrLoading.value = false
   }
@@ -601,6 +887,12 @@ function toggleLevel(value) {
   const i = permitForm.value.levels.indexOf(value)
   if (i >= 0) permitForm.value.levels.splice(i, 1)
   else permitForm.value.levels.push(value)
+}
+
+function toggleSchoolLevel(value) {
+  const i = schoolForm.value.levels.indexOf(value)
+  if (i >= 0) schoolForm.value.levels.splice(i, 1)
+  else schoolForm.value.levels.push(value)
 }
 
 // ─── Status logic ───────────────────────────────────────────────────────────
@@ -824,7 +1116,7 @@ const showEmptyState = computed(() => {
             <!-- List of permits for this school -->
             <div class="space-y-4">
               <div 
-                v-for="(p, index) in group.permits" 
+                v-for="(p) in group.permits" 
                 :key="p.id" 
                 class="pt-4 first:pt-0 border-t border-slate-100 first:border-0"
               >
@@ -844,18 +1136,20 @@ const showEmptyState = computed(() => {
                   </span>
                 </div>
                 
-                <div class="flex items-center justify-between">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-0">
                   <div class="text-sm text-slate-600">
                     <span v-if="p.permitNumber">Permit No. {{ p.permitNumber }}</span>
-                    <span v-if="p.permitNumber" class="text-slate-300 mx-2">|</span>
-                    <span>SY {{ p.schoolYear }}</span>
+                    <span v-if="p.permitNumber" class="hidden sm:inline text-slate-300 mx-2">|</span>
+                    <span :class="{'block text-xs text-slate-400 mt-1 sm:inline sm:text-sm sm:text-slate-600 sm:mt-0': p.permitNumber}">
+                      SY {{ p.schoolYear }}
+                    </span>
                   </div>
                   
                   <button
                     v-if="p.filePreviewUrl"
                     type="button"
                     @click="openPreview(p)"
-                    class="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-sky-700 bg-sky-50 rounded-lg hover:bg-sky-100 transition-colors"
+                    class="inline-flex items-center justify-center gap-2 px-3 py-1.5 text-sm font-medium text-sky-700 bg-sky-50 rounded-lg hover:bg-sky-100 transition-colors w-full sm:w-auto"
                   >
                     <FileImage :size="16" />
                     View File
@@ -873,6 +1167,60 @@ const showEmptyState = computed(() => {
     <main v-else class="max-w-4xl mx-auto px-4 py-8">
       <h2 class="text-2xl font-bold text-slate-800 mb-1">Admin Dashboard</h2>
       <p class="text-slate-600 mb-8">Manage schools and upload permit documents.</p>
+
+      <!-- Summary Dashboard (Toggleable) -->
+      <div class="mb-8">
+        <div class="flex items-center justify-between mb-4">
+           <h3 class="text-lg font-bold text-slate-800 flex items-center gap-2">
+             <LayoutDashboard class="w-5 h-5 text-sky-600" />
+             System Overview
+           </h3>
+           <button 
+             @click="showSummary = !showSummary"
+             class="text-sm text-sky-600 hover:text-sky-700 font-medium"
+           >
+             {{ showSummary ? 'Hide Summary' : 'Show Summary' }}
+           </button>
+        </div>
+        
+        <div v-if="showSummary" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 animate-in fade-in slide-in-from-top-4 duration-300">
+           <!-- Total Schools -->
+           <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
+              <div class="p-3 bg-blue-50 text-blue-600 rounded-lg">
+                <Building2 class="w-6 h-6" />
+              </div>
+              <div>
+                <p class="text-sm text-slate-500 font-medium">Registered Schools</p>
+                <p class="text-2xl font-bold text-slate-800">{{ summaryStats.totalSchools }}</p>
+              </div>
+           </div>
+           
+           <!-- Total Permits -->
+           <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
+              <div class="p-3 bg-emerald-50 text-emerald-600 rounded-lg">
+                <CheckCircle class="w-6 h-6" />
+              </div>
+              <div>
+                <p class="text-sm text-slate-500 font-medium">Active Permits</p>
+                <p class="text-2xl font-bold text-slate-800">{{ summaryStats.totalPermits }}</p>
+              </div>
+           </div>
+           
+           <!-- Level Breakdown (Mini Chart Representation) -->
+           <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-sm md:col-span-2">
+              <div class="flex items-center gap-2 mb-3">
+                 <BarChart3 class="w-5 h-5 text-slate-400" />
+                 <p class="text-sm text-slate-500 font-medium">Permits by Level</p>
+              </div>
+              <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                 <div v-for="(count, level) in summaryStats.levels" :key="level" class="text-center p-2 bg-slate-50 rounded-lg">
+                    <span class="block text-xs text-slate-500 truncate mb-1" :title="level">{{ level.replace('School', '') }}</span>
+                    <span class="block text-lg font-bold text-slate-800">{{ count }}</span>
+                 </div>
+              </div>
+           </div>
+        </div>
+      </div>
 
       <!-- Create New School card -->
       <section class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 mb-6">
@@ -906,60 +1254,46 @@ const showEmptyState = computed(() => {
         </div>
 
         <form @submit.prevent="createSchool" class="space-y-4">
-          <!-- School Form Fields -->
-          <div v-if="createTab === 'school'" class="space-y-4">
-            <div>
-              <label for="schoolName" class="block text-sm font-medium text-slate-700 mb-1">
-                School Name <span class="text-red-500">*</span>
-              </label>
-              <input
-                id="schoolName"
-                v-model="schoolForm.name"
-                type="text"
-                placeholder="e.g., St. Mary's Academy"
-                class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none"
-                :class="{ 'border-red-500': schoolFormErrors.name }"
-              />
-              <p v-if="schoolFormErrors.name" class="mt-1 text-sm text-red-600">{{ schoolFormErrors.name }}</p>
+          
+          <!-- Upload Scan for Details (Common) -->
+          <div class="mb-4 p-4 bg-slate-50 rounded-lg border border-dashed border-slate-300">
+            <label class="block text-sm font-medium text-slate-700 mb-2">
+               Auto-fill details from Document (Optional)
+            </label>
+            <div class="flex items-center gap-4">
+               <input 
+                 type="file" 
+                 accept=".pdf,image/*" 
+                 @change="onSchoolFileChange"
+                 class="block w-full text-sm text-slate-500
+                    file:mr-4 file:py-2 file:px-4
+                    file:rounded-full file:border-0
+                    file:text-sm file:font-semibold
+                    file:bg-sky-50 file:text-sky-700
+                    hover:file:bg-sky-100"
+               />
+               <div v-if="schoolForm.ocrLoading" class="flex items-center text-sky-600 text-sm">
+                 <Loader2 class="w-4 h-4 mr-2 animate-spin" />
+                 Scanning...
+               </div>
             </div>
-            <!-- School Type is now implicitly Private -->
-            <!--
-            <div>
-              <label class="block text-sm font-medium text-slate-700 mb-1">School Type <span class="text-red-500">*</span></label>
-              <div class="flex gap-4">
-                <label class="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="radio"
-                    v-model="schoolForm.type"
-                    value="Private"
-                    class="text-sky-600 focus:ring-sky-500"
-                    checked
-                    disabled
-                  />
-                  <span class="text-slate-700">Private School</span>
-                </label>
-              </div>
-            </div>
-            -->
+            <p class="text-xs text-slate-500 mt-2">Upload a permit or registration document to auto-detect details.</p>
           </div>
 
-          <!-- Homeschooling Form Fields -->
-          <div v-else class="space-y-4">
-            <div>
-              <label for="providerName" class="block text-sm font-medium text-slate-700 mb-1">
-                Homeschooling Provider Name <span class="text-red-500">*</span>
-              </label>
-              <input
-                id="providerName"
-                v-model="schoolForm.name"
-                type="text"
-                placeholder="e.g., Happy Homeschool Center"
-                class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none"
-                :class="{ 'border-red-500': schoolFormErrors.name }"
-              />
-              <p v-if="schoolFormErrors.name" class="mt-1 text-sm text-red-600">{{ schoolFormErrors.name }}</p>
-            </div>
-            <!-- Hidden type is already set to 'Homeschooling' by setCreateTab -->
+          <!-- Name Field (Dynamic Label) -->
+          <div>
+            <label for="schoolName" class="block text-sm font-medium text-slate-700 mb-1">
+              {{ createTab === 'school' ? 'School Name' : 'Homeschooling Provider Name' }} <span class="text-red-500">*</span>
+            </label>
+            <input
+              id="schoolName"
+              v-model="schoolForm.name"
+              type="text"
+              :placeholder="createTab === 'school' ? 'e.g., St. Mary\'s Academy' : 'e.g., Happy Homeschool Center'"
+              class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none"
+              :class="{ 'border-red-500': schoolFormErrors.name }"
+            />
+            <p v-if="schoolFormErrors.name" class="mt-1 text-sm text-red-600">{{ schoolFormErrors.name }}</p>
           </div>
 
           <!-- Common Address Field -->
@@ -974,6 +1308,122 @@ const showEmptyState = computed(() => {
             />
           </div>
 
+          <!-- Unified Permit Details Section -->
+          <div class="mt-6 pt-6 border-t border-slate-200 animate-in fade-in slide-in-from-top-4 duration-500">
+             <div class="flex items-center gap-2 mb-4">
+                <div class="p-1 rounded bg-emerald-100 text-emerald-600">
+                   <Shield :size="16" />
+                </div>
+                <h3 class="text-sm font-semibold text-slate-800">
+                  {{ createTab === 'school' ? 'Permit Details' : 'Application Data' }}
+                </h3>
+             </div>
+
+             <!-- Levels -->
+             <div class="mb-4">
+                <label class="block text-sm font-medium text-slate-700 mb-2">Program / Level</label>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <label 
+                    v-for="opt in levelOptions" 
+                    :key="opt.value" 
+                    class="flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-all duration-200"
+                    :class="schoolForm.levels.includes(opt.value) ? 'border-sky-500 bg-sky-50' : 'border-slate-200 hover:border-slate-300'"
+                  >
+                    <div 
+                      class="w-5 h-5 rounded border flex items-center justify-center transition-colors"
+                      :class="schoolForm.levels.includes(opt.value) ? 'bg-sky-500 border-sky-500' : 'border-slate-300 bg-white'"
+                    >
+                      <CheckCircle v-if="schoolForm.levels.includes(opt.value)" class="w-3.5 h-3.5 text-white" />
+                    </div>
+                    <input 
+                      type="checkbox" 
+                      :value="opt.value" 
+                      class="hidden"
+                      @change="toggleSchoolLevel(opt.value)"
+                      :checked="schoolForm.levels.includes(opt.value)"
+                    >
+                    <span class="text-sm font-medium" :class="schoolForm.levels.includes(opt.value) ? 'text-sky-900' : 'text-slate-700'">
+                      {{ opt.label }}
+                    </span>
+                  </label>
+                </div>
+             </div>
+
+             <!-- Permit No & SY -->
+             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div v-if="createTab === 'school'">
+                   <label class="block text-sm font-medium text-slate-700 mb-1">Permit Number</label>
+                   <div class="relative overflow-hidden rounded-lg">
+                      <input 
+                        v-model="schoolForm.permitNumber"
+                        type="text"
+                        class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none pr-10"
+                        :class="[
+                           schoolForm.permitNumber ? 'bg-emerald-50 border-emerald-200' : '',
+                           schoolForm.ocrLoading ? 'border-sky-400 ring-2 ring-sky-100' : ''
+                        ]"
+                      />
+                      
+                      <!-- Scanning Effect Overlay (Shimmer) -->
+                      <div v-if="schoolForm.ocrLoading" class="absolute inset-0 pointer-events-none rounded-lg overflow-hidden">
+                         <div class="absolute top-0 left-0 w-full h-full bg-gradient-to-r from-transparent via-sky-400/10 to-transparent -translate-x-full animate-shimmer"></div>
+                      </div>
+
+                      <!-- Animated Loading Icon (Document Scan) -->
+                      <div v-if="schoolForm.ocrLoading" class="absolute right-3 top-1/2 -translate-y-1/2">
+                        <div class="relative w-5 h-5">
+                           <svg class="w-full h-full text-sky-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                              <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                           </svg>
+                           <!-- Scanning Beam Line -->
+                           <div class="absolute top-0 left-0 w-full h-[2px] bg-sky-600 shadow-[0_0_8px_rgba(2,132,199,0.8)] animate-scan-vertical"></div>
+                        </div>
+                      </div>
+
+                      <div v-else-if="schoolForm.permitNumber" class="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-600 flex items-center gap-1 text-xs font-medium">
+                         <CheckCircle :size="14" />
+                         Match
+                      </div>
+                   </div>
+                </div>
+                <div>
+                   <label class="block text-sm font-medium text-slate-700 mb-1">School Year</label>
+                   <div class="relative">
+                      <input 
+                        v-model="schoolForm.schoolYear"
+                        type="text"
+                        class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none"
+                        :class="schoolForm.schoolYear ? 'bg-emerald-50 border-emerald-200' : ''"
+                      />
+                      <div v-if="schoolForm.schoolYear" class="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-600 flex items-center gap-1 text-xs font-medium">
+                         <CheckCircle :size="14" />
+                         Match
+                      </div>
+                   </div>
+                </div>
+             </div>
+             
+             <!-- Strands -->
+             <div v-if="schoolForm.levels.includes('Senior High School')" class="mt-4 p-4 bg-slate-50 rounded-lg border border-slate-200">
+                <label class="block text-sm font-medium text-slate-800 mb-2">SHS Strands</label>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <label 
+                    v-for="strand in ['STEM', 'ABM', 'HUMSS', 'GAS', 'TVL', 'Arts and Design', 'Sports']" 
+                    :key="strand" 
+                    class="flex items-center gap-2 cursor-pointer"
+                  >
+                    <input 
+                      type="checkbox" 
+                      :value="strand" 
+                      v-model="schoolForm.strands"
+                      class="rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                    >
+                    <span class="text-sm text-slate-700">{{ strand }}</span>
+                  </label>
+                </div>
+             </div>
+          </div>
+
           <button
             type="submit"
             class="w-full py-2.5 rounded-lg bg-sky-600 text-white font-medium hover:bg-sky-700 transition-colors"
@@ -983,194 +1433,6 @@ const showEmptyState = computed(() => {
         </form>
       </section>
 
-      <!-- Upload Permit card -->
-      <section class="bg-white rounded-xl border border-slate-200 shadow-sm p-6">
-        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
-          <div class="flex items-center gap-2">
-            <div class="p-1.5 rounded-lg" :class="manageTab === 'permit' ? 'bg-emerald-100 text-emerald-600' : 'bg-orange-100 text-orange-600'">
-              <Upload v-if="manageTab === 'permit'" :size="20" />
-              <FileImage v-else :size="20" />
-            </div>
-            <h3 class="text-lg font-semibold text-slate-800">
-              {{ manageTab === 'permit' ? 'Upload Permit' : 'Add Application Data' }}
-            </h3>
-          </div>
-
-          <!-- Tabs -->
-          <div class="flex bg-slate-100 p-1 rounded-lg self-start sm:self-auto">
-            <button
-              type="button"
-              @click="setManageTab('permit')"
-              class="px-4 py-1.5 text-sm font-medium rounded-md transition-all"
-              :class="manageTab === 'permit' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'"
-            >
-              School Permits
-            </button>
-            <button
-              type="button"
-              @click="setManageTab('application')"
-              class="px-4 py-1.5 text-sm font-medium rounded-md transition-all"
-              :class="manageTab === 'application' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'"
-            >
-              Homeschooling
-            </button>
-          </div>
-        </div>
-
-        <form @submit.prevent="submitPermit" class="space-y-4">
-          <div>
-            <label for="selectSchool" class="block text-sm font-medium text-slate-700 mb-1">
-              {{ manageTab === 'permit' ? 'Select School' : 'Select Provider' }} <span class="text-red-500">*</span>
-            </label>
-            <CustomSelect
-              v-model="permitForm.schoolId"
-              :options="manageTab === 'permit' 
-                ? schoolOptions.map(s => ({ value: s.id, label: s.name })) 
-                : homeschoolOptions.map(s => ({ value: s.id, label: s.name }))"
-              :placeholder="manageTab === 'permit' ? '-- Select School --' : '-- Select Provider --'"
-              :error="!!permitFormErrors.schoolId"
-            />
-            <p v-if="permitFormErrors.schoolId" class="mt-1 text-sm text-red-600">{{ permitFormErrors.schoolId }}</p>
-            <p v-if="manageTab === 'permit' && !schoolOptions.length" class="mt-1 text-sm text-amber-600">Create a school above first.</p>
-            <p v-if="manageTab === 'application' && !homeschoolOptions.length" class="mt-1 text-sm text-amber-600">Create a homeschooling provider above first.</p>
-          </div>
-          <!-- Multiple Levels Checkboxes -->
-          <div>
-            <label class="block text-sm font-medium text-slate-700 mb-2">Select Level(s)/Program(s) <span class="text-red-500">*</span></label>
-            <div class="grid grid-cols-2 gap-3">
-              <label 
-                v-for="opt in levelOptions" 
-                :key="opt.value" 
-                class="flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-all duration-200"
-                :class="permitForm.levels.includes(opt.value) ? 'border-sky-500 bg-sky-50' : 'border-slate-200 hover:border-slate-300'"
-              >
-                <div 
-                  class="w-5 h-5 rounded border flex items-center justify-center transition-colors"
-                  :class="permitForm.levels.includes(opt.value) ? 'bg-sky-500 border-sky-500' : 'border-slate-300 bg-white'"
-                >
-                  <CheckCircle v-if="permitForm.levels.includes(opt.value)" class="w-3.5 h-3.5 text-white" />
-                </div>
-                <input 
-                  type="checkbox" 
-                  :value="opt.value" 
-                  class="hidden"
-                  @change="toggleLevel(opt.value)"
-                  :checked="permitForm.levels.includes(opt.value)"
-                >
-                <span class="text-sm font-medium" :class="permitForm.levels.includes(opt.value) ? 'text-sky-900' : 'text-slate-700'">
-                  {{ opt.label }}
-                </span>
-              </label>
-            </div>
-            <p v-if="permitFormErrors.levels" class="mt-1 text-sm text-red-500">{{ permitFormErrors.levels }}</p>
-          </div>
-          <div>
-            <label for="schoolYear" class="block text-sm font-medium text-slate-700 mb-1">
-              School Year <span class="text-red-500">*</span>
-            </label>
-            <div class="relative">
-              <Calendar class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" :size="18" />
-              <input
-                id="schoolYear"
-                v-model="permitForm.schoolYear"
-                type="text"
-                placeholder="YYYY-YYYY (e.g. 2024-2025)"
-                class="w-full pl-10 pr-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none"
-                :class="{ 'border-red-500': permitFormErrors.schoolYear }"
-                maxlength="9"
-              />
-            </div>
-            <p v-if="permitFormErrors.schoolYear" class="mt-1 text-sm text-red-600">{{ permitFormErrors.schoolYear }}</p>
-          </div>
-
-          <!-- Strands Checklist (Only if Senior High School is selected) -->
-          <div v-if="permitForm.levels.includes('Senior High School')" class="space-y-2 bg-slate-50 p-4 rounded-lg border border-slate-200">
-            <label class="block text-sm font-medium text-slate-800">Senior High School Strands</label>
-            <div class="grid grid-cols-2 gap-2">
-              <label 
-                v-for="strand in ['STEM', 'ABM', 'HUMSS', 'GAS', 'TVL', 'Arts and Design', 'Sports']" 
-                :key="strand" 
-                class="flex items-center gap-2 cursor-pointer"
-              >
-                <input 
-                  type="checkbox" 
-                  :value="strand" 
-                  v-model="permitForm.strands"
-                  class="rounded border-slate-300 text-sky-600 focus:ring-sky-500"
-                >
-                <span class="text-sm text-slate-700">{{ strand }}</span>
-              </label>
-            </div>
-          </div>
-          
-          <div v-if="manageTab === 'permit'">
-            <label class="block text-sm font-medium text-slate-700 mb-1">Upload Copy <span class="text-red-500">*</span></label>
-            <input
-              type="file"
-              accept="image/*,application/pdf"
-              class="block w-full text-sm text-slate-600 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-sky-50 file:text-sky-700 file:font-medium hover:file:bg-sky-100"
-              :class="{ 'border-red-500': permitFormErrors.upload }"
-              @change="onPermitFileChange"
-            />
-            <div v-if="permitForm.filePreviewUrl" class="mt-2 rounded-lg border border-slate-200 overflow-hidden bg-slate-50">
-              <a
-                :href="permitForm.filePreviewUrl"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="block"
-              >
-                <template v-if="permitForm.file?.type?.startsWith('image/')">
-                  <img
-                    :src="permitForm.filePreviewUrl"
-                    alt="Permit preview"
-                    class="w-full max-h-40 object-contain"
-                  />
-                </template>
-                <template v-else>
-                  <div class="p-3 text-sm text-slate-700">{{ permitForm.fileName }}</div>
-                </template>
-              </a>
-            </div>
-            <p v-if="permitFormErrors.upload" class="mt-1 text-sm text-red-600">{{ permitFormErrors.upload }}</p>
-            <p class="mt-1 text-xs text-slate-500">The system reads permit number from images or PDFs.</p>
-          </div>
-
-          <div v-if="manageTab === 'permit' && (permitForm.filePreviewUrl || ocrLoading)">
-            <label for="permitNumber" class="block text-sm font-medium text-slate-700 mb-1">Permit Number</label>
-            <div class="relative">
-              <input
-                id="permitNumber"
-                v-model="permitForm.permitNumber"
-                type="text"
-                placeholder="Auto-filled from document or type manually"
-                class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none pr-10"
-                :class="{ 'border-red-500': permitFormErrors.permitNumber, 'border-emerald-500': permitForm.permitNumber && !permitFormErrors.permitNumber }"
-              />
-              <Loader2
-                v-if="ocrLoading"
-                class="absolute right-3 top-1/2 -translate-y-1/2 text-sky-500 animate-spin"
-                :size="18"
-              />
-              <CheckCircle
-                v-else-if="permitForm.permitNumber && !permitFormErrors.permitNumber && /^[A-Z0-9-]+$/i.test(permitForm.permitNumber) && /\d/.test(permitForm.permitNumber)"
-                class="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-500"
-                :size="18"
-              />
-            </div>
-            <p v-if="permitFormErrors.permitNumber" class="mt-1 text-sm text-red-600">{{ permitFormErrors.permitNumber }}</p>
-            <p v-else-if="permitForm.permitNumber && /^[A-Z0-9-]+$/i.test(permitForm.permitNumber) && /\d/.test(permitForm.permitNumber)" class="mt-1 text-xs text-emerald-600">
-              Valid Government Permit Format
-            </p>
-          </div>
-          
-          <button
-            type="submit"
-            class="w-full py-2.5 rounded-lg bg-sky-600 text-white font-medium hover:bg-sky-700 transition-colors"
-          >
-            {{ manageTab === 'permit' ? 'Submit Permit' : 'Submit Application Data' }}
-          </button>
-        </form>
-      </section>
     </main>
 
     <div
@@ -1221,7 +1483,7 @@ const showEmptyState = computed(() => {
         v-if="showConfirmation"
         class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
       >
-        <div class="bg-white rounded-xl shadow-2xl max-w-md w-full p-6 border border-slate-100">
+        <div class="bg-white rounded-xl shadow-2xl max-w-md w-full p-4 sm:p-6 border border-slate-100">
           <div class="flex items-center gap-3 text-amber-600 mb-4">
             <div class="p-2 bg-amber-50 rounded-full">
               <Shield :size="24" class="text-amber-500" />
@@ -1252,3 +1514,29 @@ const showEmptyState = computed(() => {
     </Transition>
   </div>
 </template>
+
+<style scoped>
+/* Custom Animations for Unique Loading Experience */
+
+/* Shimmer Effect for Input Background */
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Vertical Scan Beam for Document Icon */
+@keyframes scan-vertical {
+  0% { top: 15%; opacity: 0; }
+  15% { opacity: 1; }
+  85% { opacity: 1; }
+  100% { top: 85%; opacity: 0; }
+}
+
+.animate-shimmer {
+  animation: shimmer 1.5s infinite linear;
+}
+
+.animate-scan-vertical {
+  animation: scan-vertical 1.5s infinite linear;
+}
+</style>
