@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue'
-import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard } from 'lucide-vue-next'
+import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2 } from 'lucide-vue-next'
 import Tesseract from 'tesseract.js'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
@@ -9,11 +9,11 @@ import CustomSelect from './components/CustomSelect.vue'
 GlobalWorkerOptions.workerSrc = workerSrc
 
 // ─── View state ─────────────────────────────────────────────────────────────
-const currentView = ref('search') // 'search' | 'admin'
+const currentView = ref('admin') // 'search' | 'admin'
 
 const API_URL = 'http://localhost:3000/api'
 
-const showSummary = ref(false)
+// const showSummary = ref(false) // Removed as per request
 
 const summaryStats = computed(() => {
   const totalSchools = schools.value.length
@@ -28,8 +28,8 @@ const summaryStats = computed(() => {
   }
   
   permits.value.forEach(p => {
-    // Parse level string "Kindergarten, Elementary"
-    const pLevels = (p.level || '').split(',').map(l => l.trim())
+    // p.levels is an array from backend
+    const pLevels = Array.isArray(p.levels) ? p.levels : []
     pLevels.forEach(l => {
       if (levels[l] !== undefined) levels[l]++
     })
@@ -53,7 +53,13 @@ const schools = ref([])
 const permits = ref([])
 const previewPermit = ref(null)
 
-onMounted(async () => {
+// ─── Edit / Delete Logic ─────────────────────────────────────────────────────
+const isEditingSchool = ref(false)
+const isEditingPermit = ref(false)
+const editSchoolForm = ref({})
+const editPermitForm = ref({})
+
+async function refreshData() {
   try {
     const [schoolsRes, permitsRes] = await Promise.all([
       fetch(`${API_URL}/schools`),
@@ -64,6 +70,131 @@ onMounted(async () => {
   } catch (error) {
     console.error('Failed to fetch data:', error)
   }
+}
+
+// School CRUD
+function openEditSchool(schoolId) {
+  const s = schools.value.find(s => s.id === schoolId)
+  if (!s) return
+  editSchoolForm.value = { ...s }
+  isEditingSchool.value = true
+}
+
+async function deleteSchool(schoolId) {
+  const confirmed = await confirmAction('Are you sure you want to delete this school? All its permits will also be deleted.')
+  if (!confirmed) return
+  
+  try {
+    const res = await fetch(`${API_URL}/schools/${schoolId}`, { method: 'DELETE' })
+    if (res.ok) {
+      showToast('School deleted successfully', 'success')
+      refreshData()
+    } else {
+      throw new Error('Failed to delete')
+    }
+  } catch (err) {
+    showToast('Failed to delete school', 'error')
+  }
+}
+
+async function saveEditSchool() {
+  if (!editSchoolForm.value.name) return
+  
+  try {
+    const res = await fetch(`${API_URL}/schools/${editSchoolForm.value.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(editSchoolForm.value)
+    })
+    
+    if (res.ok) {
+      showToast('School updated successfully', 'success')
+      isEditingSchool.value = false
+      refreshData()
+    } else {
+      throw new Error('Failed to update')
+    }
+  } catch (err) {
+    showToast('Failed to update school', 'error')
+  }
+}
+
+// Permit CRUD
+function openEditPermit(permit) {
+  editPermitForm.value = { 
+    ...permit,
+    // Ensure levels is array
+    levels: Array.isArray(permit.levels) ? permit.levels : [],
+    // For file upload
+    file: null,
+    fileName: permit.fileName || '',
+    filePreviewUrl: permit.filePreviewUrl
+  }
+  isEditingPermit.value = true
+}
+
+async function deletePermit(permitId) {
+  const confirmed = await confirmAction('Are you sure you want to delete this permit?')
+  if (!confirmed) return
+  
+  try {
+    const res = await fetch(`${API_URL}/permits/${permitId}`, { method: 'DELETE' })
+    if (res.ok) {
+      showToast('Permit deleted successfully', 'success')
+      refreshData()
+    } else {
+      throw new Error('Failed to delete')
+    }
+  } catch (err) {
+    showToast('Failed to delete permit', 'error')
+  }
+}
+
+async function saveEditPermit() {
+  const formData = new FormData()
+  formData.append('schoolId', editPermitForm.value.schoolId)
+  formData.append('levels', JSON.stringify(editPermitForm.value.levels))
+  formData.append('schoolYear', editPermitForm.value.schoolYear)
+  formData.append('permitNumber', editPermitForm.value.permitNumber)
+  formData.append('extractedText', editPermitForm.value.extractedText || '')
+  
+  if (editPermitForm.value.file) {
+    formData.append('file', editPermitForm.value.file)
+  }
+  
+  try {
+    const res = await fetch(`${API_URL}/permits/${editPermitForm.value.id}`, {
+      method: 'PUT',
+      body: formData
+    })
+    
+    if (res.ok) {
+      showToast('Permit updated successfully', 'success')
+      isEditingPermit.value = false
+      refreshData()
+    } else {
+      throw new Error('Failed to update')
+    }
+  } catch (err) {
+    showToast('Failed to update permit', 'error')
+  }
+}
+
+function onEditPermitFileChange(e) {
+  const file = e.target.files?.[0]
+  if (!file) return
+  editPermitForm.value.file = file
+  editPermitForm.value.fileName = file.name
+}
+
+function toggleEditPermitLevel(value) {
+  const i = editPermitForm.value.levels.indexOf(value)
+  if (i >= 0) editPermitForm.value.levels.splice(i, 1)
+  else editPermitForm.value.levels.push(value)
+}
+
+onMounted(async () => {
+  await refreshData()
 })
 
 const searchQuery = ref('')
@@ -156,7 +287,18 @@ async function onSchoolFileChange(e) {
     
     schoolForm.value.extractedText = text
 
-    // Block signatures (Clean text)
+    // ─── Smart Context Detection ───
+    // Prioritize "Government Permit" or "Government Recognition" sections over Indorsements
+    let textToAnalyze = text
+    const permitHeaderMatch = text.match(/(?:GOVERNMENT\s+(?:RECOGNITION|PERMIT)|AUTHORITY\s+TO\s+OPERATE)/i)
+    
+    if (permitHeaderMatch) {
+       // Focus analysis starting from the Permit header
+       // We keep a bit of context before just in case, but mainly look forward
+       textToAnalyze = text.substring(permitHeaderMatch.index)
+    }
+
+    // Block signatures (Clean text) from the relevant section
     const signatureMarkers = [
       /Approved\s+by:/i,
       /Signed\s+by:/i,
@@ -166,7 +308,8 @@ async function onSchoolFileChange(e) {
       /Regional\s+Director/i,
       /Digitally\s+signed/i
     ]
-    let cleanTextForName = text
+
+    let cleanTextForName = textToAnalyze
     for (const marker of signatureMarkers) {
       const match = cleanTextForName.match(marker)
       if (match) {
@@ -182,13 +325,22 @@ async function onSchoolFileChange(e) {
     const schoolKeywords = ['School', 'Academy', 'College', 'Institute', 'University', 'Montessori', 'Learning Center']
     let foundName = ''
     
-    // Strategy 1: Explicit labels
+    // Strategy 0: Government Recognition "To <Name>" Pattern
+    // Image format: "To \n SCHOLA ANGELICUS \n (School)"
+    const toMatch = cleanTextForName.match(/To\s*\n+([A-Z\s.,&'-]+?)(?:\n+\(School\))?(?:\n|$)/i)
+    if (toMatch && toMatch[1] && !toMatch[1].includes('Regional Director')) {
+        foundName = toMatch[1].trim()
+    }
+    
+    if (!foundName) {
+      // Strategy 1: Explicit labels
     for (let i = 0; i < lines.length - 1; i++) {
        const nextLine = lines[i+1].toLowerCase().replace(/\s/g, '')
        if (nextLine.includes('(school)') || nextLine.includes('(nameofschool)')) {
           foundName = lines[i]
           break
        }
+    }
     }
 
     if (!foundName) {
@@ -238,6 +390,15 @@ async function onSchoolFileChange(e) {
     // Find Address (Refined for "City, Province" without unnecessary words)
     let foundAddress = ''
     
+    // Strategy 0: Address between "(School)" and "(Complete Address)"
+    // Matches "SCHOLA ANGELICUS \n (School) \n St. Joseph Village 7... \n (Complete Address)"
+    // We look for text AFTER (School) and BEFORE (Complete Address)
+    const addressBetweenMatch = cleanTextForName.match(/\(School\)\s*\n+([^\n]+)(?:\n+\(Complete Address\))?/i)
+    if (addressBetweenMatch && addressBetweenMatch[1]) {
+       foundAddress = addressBetweenMatch[1].trim()
+    }
+    
+    if (!foundAddress) {
     // Strategy 1: Explicit labels
     for (let i = 0; i < lines.length - 1; i++) {
        const nextLine = lines[i+1].toLowerCase().replace(/\s/g, '')
@@ -245,6 +406,7 @@ async function onSchoolFileChange(e) {
           foundAddress = lines[i]
           break
        }
+    }
     }
 
     if (!foundAddress) {
@@ -539,6 +701,38 @@ function extractPermitDetails(text) {
   // Matches: "Government Permit (Region IV-A) No. K-123 s. 2024" or "GP No. 123 s. 2023"
   const gpRegex = /(?:Government\s+Permit|GP)(?:\s+\(Region\s+[IVX\d\w-]+\))?\s+No\.?\s*([A-Z0-9-]+)\s*s\.?\s*(\d{4})/gi
   
+  // Special Case: Government Recognition (No Permit Number usually, but effectively a permit)
+  // Format: "GOVERNMENT RECOGNITION ... for the Complete Elementary Course ... effective as of SY 2018 - 2019"
+  // Also supports "Government Recognition No. 123 s. 2020" if present
+  if (/GOVERNMENT\s+RECOGNITION/i.test(t)) {
+     // Try to find a number if it exists
+     const grNumMatch = t.match(/Government\s+Recognition\s+(?:No\.?)?\s*([A-Z0-9-]+)\s*s\.?\s*(\d{4})/i)
+     
+     // Extract SY (Priority to "effective as of SY")
+     const syMatch = t.match(/effective\s+as\s+of\s+SY\s+(\d{4}\s*[-–]\s*\d{4})/i)
+     const grSy = syMatch ? syMatch[1].replace(/\s/g, '') : (grNumMatch ? grNumMatch[2] : '')
+     
+     // Extract Course/Level
+     const courseMatch = t.match(/for\s+the\s+([A-Za-z\s]+?)\s+Course/i)
+     const rawCourse = courseMatch ? courseMatch[1] : ''
+     
+     const levels = []
+     if (/Kindergarten/i.test(rawCourse)) levels.push('Kindergarten')
+     if (/Elementary/i.test(rawCourse)) levels.push('Elementary')
+     if (/Junior\s*High/i.test(rawCourse)) levels.push('Junior High School')
+     if (/Senior\s*High/i.test(rawCourse)) levels.push('Senior High School')
+     
+     // If we found a valid SY and Levels, add it
+     if (grSy && levels.length > 0) {
+        permits.push({
+           permitNumber: grNumMatch ? grNumMatch[1] : 'Gov. Recognition',
+           schoolYear: grSy,
+           levels: levels,
+           strands: []
+        })
+     }
+  }
+
   let match
   while ((match = gpRegex.exec(t)) !== null) {
     const pNum = match[1].trim()
@@ -548,10 +742,11 @@ function extractPermitDetails(text) {
     const levels = []
     let strands = []
     
-    if (/^K-/i.test(pNum)) levels.push('Kindergarten')
-    else if (/^E-/i.test(pNum)) levels.push('Elementary')
-    else if (/^JHS-/i.test(pNum) || /^S-/i.test(pNum)) levels.push('Junior High School')
-    else if (/^SHS-/i.test(pNum)) {
+    // User Requirement: K=Kindergarten, E=Elementary, S=Junior High, SHS=Senior High
+    if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
+    else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
+    else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School') // Support both S and JHS (legacy)
+    else if (/^SHS[-]/i.test(pNum)) {
       levels.push('Senior High School')
     }
     
@@ -586,6 +781,7 @@ function extractPermitDetails(text) {
       const patterns = [
         { regex: /(SHS\s*-\s*\d+)/i, level: 'Senior High School' },
         { regex: /(JHS\s*-\s*\d+)/i, level: 'Junior High School' },
+        { regex: /(S\s*-\s*\d+)/i, level: 'Junior High School' },
         { regex: /(K\s*-\s*\d+)/i, level: 'Kindergarten' },
         { regex: /(E\s*-\s*\d+)/i, level: 'Elementary' }
       ]
@@ -899,27 +1095,61 @@ function toggleSchoolLevel(value) {
 function getStatus(schoolYear) {
   if (!schoolYear) return { label: 'Unknown', color: 'gray' }
   
-  // Parse YYYY-YYYY
+  let endYear = null
+  
+  // Try to parse "YYYY-YYYY"
   const parts = schoolYear.split('-').map(p => parseInt(p.trim(), 10))
-  if (parts.length !== 2 || isNaN(parts[0]) || isNaN(parts[1])) {
+  if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+    endYear = parts[1]
+  } else {
+    // Try single year "YYYY"
+    const single = parseInt(schoolYear.trim(), 10)
+    if (!isNaN(single)) {
+      // If "2018", assume SY 2018-2019, so end year is 2019
+      endYear = single + 1
+    }
+  }
+
+  if (!endYear) {
     return { label: 'Invalid SY', color: 'gray' }
   }
   
-  // Assumption: School Year 2024-2025 expires effectively around mid-2025.
-  // Let's set expiration date to July 31 of the end year.
-  // End Year = parts[1]
-  const endYear = parts[1]
-  const expirationDate = new Date(endYear, 6, 31) // Month 6 is July
+  // Logic:
+  // 1. Operating: Until Dec 31 of the End Year
+  // 2. For Renewal: For 1 year after expiration
+  // 3. Closed: If not renewed after 1 year (expiration + 1 year)
   
+  const expirationDate = new Date(endYear, 11, 31) // Dec 31 of End Year
   const now = new Date()
+  
+  // Reset hours for accurate day calc
   now.setHours(0, 0, 0, 0)
   expirationDate.setHours(0, 0, 0, 0)
   
-  const daysLeft = Math.floor((expirationDate - now) / (24 * 60 * 60 * 1000))
+  const msPerDay = 24 * 60 * 60 * 1000
+  const daysPast = Math.floor((now - expirationDate) / msPerDay)
   
-  if (daysLeft < 0) return { label: 'Closed', color: 'red' }
-  if (daysLeft <= 60) return { label: 'For Renewal', color: 'yellow' }
-  return { label: 'Operational', color: 'green' }
+  if (daysPast <= 0) {
+    return { label: 'Operating', color: 'green' }
+  } else {
+    // As per user request: "It said to be closed it should be for renewal since the government permit renews yearly."
+    // Any expired permit is "For Renewal" until renewed.
+    return { label: 'For Renewal', color: 'yellow' }
+  }
+}
+
+function getOverallSchoolStatus(permits) {
+  if (!permits || permits.length === 0) return { label: 'No Records', color: 'gray' }
+
+  // Check priorities: Operating > For Renewal
+  const statuses = permits.map(p => getStatus(p.schoolYear))
+  
+  if (statuses.some(s => s.label === 'Operating')) {
+    return { label: 'Operating', color: 'green' }
+  }
+  
+  // If not operating, it's For Renewal (since we removed Closed for expired)
+  return { label: 'For Renewal', color: 'yellow' }
 }
 
 function getSchoolName(schoolId) {
@@ -927,7 +1157,7 @@ function getSchoolName(schoolId) {
 }
 
 function getSchoolType(schoolId) {
-  return schools.value.find((s) => s.id === schoolId)?.type ?? 'Public'
+  return schools.value.find((s) => s.id === schoolId)?.type ?? 'Private'
 }
 
 function openPreview(p) {
@@ -939,7 +1169,7 @@ function closePreview() {
 }
 
 // ─── Public Search: filtered results ────────────────────────────────────────
-const filterType = ref('All') // 'All' | 'Public' | 'Private'
+const filterType = ref('All') // 'All' | 'Private' | 'Homeschooling'
 
 const searchResults = computed(() => {
   const q = searchQuery.value.trim().toLowerCase()
@@ -1021,169 +1251,43 @@ const showEmptyState = computed(() => {
         <nav class="flex items-center gap-4 sm:gap-6 w-full sm:w-auto justify-center sm:justify-end">
           <button
             type="button"
-            @click="currentView = 'search'"
-            class="inline-flex items-center gap-2 text-sm font-medium transition-colors"
-            :class="currentView === 'search' ? 'text-sky-600' : 'text-slate-500 hover:text-slate-700'"
-          >
-            <Home :size="18" />
-            Public Search
-          </button>
-          <button
-            type="button"
             @click="currentView = 'admin'"
             class="inline-flex items-center gap-2 text-sm font-medium transition-colors"
             :class="currentView === 'admin' ? 'text-sky-600' : 'text-slate-500 hover:text-slate-700'"
           >
-            <Building2 :size="18" />
+            <LayoutDashboard :size="18" />
             Admin Dashboard
+          </button>
+          <button
+            type="button"
+            @click="currentView = 'registration'"
+            class="inline-flex items-center gap-2 text-sm font-medium transition-colors"
+            :class="currentView === 'registration' ? 'text-sky-600' : 'text-slate-500 hover:text-slate-700'"
+          >
+            <Plus :size="18" />
+            Registration
           </button>
         </nav>
       </div>
     </header>
 
-    <!-- ─── Public Search view ─────────────────────────────────────────────── -->
-    <main v-if="currentView === 'search'" class="max-w-5xl mx-auto px-4 py-8">
-      <h2 class="text-2xl font-bold text-slate-800 text-center mb-1">Search School Permits</h2>
-      <p class="text-slate-600 text-center mb-8">
-        Enter a school name to view permit status by education level
-      </p>
-
-      <div class="flex flex-col sm:flex-row gap-4 mb-8">
-        <div class="relative flex-1">
-          <Search
-            class="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400"
-            :size="20"
-          />
-          <input
-            v-model="rawSearchInput"
-            type="text"
-            placeholder="Search for a school..."
-            class="w-full pl-12 pr-4 py-3 rounded-lg border border-slate-300 bg-white focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none text-slate-800 placeholder-slate-400"
-          />
-        </div>
-        <CustomSelect
-          v-model="filterType"
-          :options="[
-            { value: 'All', label: 'All Types' },
-            { value: 'Public', label: 'Public' },
-            { value: 'Private', label: 'Private' },
-            { value: 'Homeschooling', label: 'Homeschooling' }
-          ]"
-          class="w-48"
-        />
+    <!-- ─── Admin Dashboard view (Summary + Search) ────────────────────────── -->
+    <main v-if="currentView === 'admin'" class="max-w-6xl mx-auto px-4 py-8">
+      <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
+         <div>
+            <h2 class="text-2xl font-bold text-slate-800">Admin Dashboard</h2>
+            <p class="text-slate-600">System Overview & Permit Management</p>
+         </div>
       </div>
 
-      <!-- Loading State -->
-      <div v-if="isSearching" class="py-12 text-center">
-        <Loader2 class="animate-spin mx-auto text-sky-600 mb-4" :size="40" />
-        <p class="text-slate-600 font-medium">Searching...</p>
-      </div>
-
-      <!-- Empty state card (mockup style) -->
-      <div
-        v-else-if="showEmptyState"
-        class="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center"
-      >
-        <div class="inline-flex items-center justify-center w-20 h-20 rounded-full bg-sky-50 text-sky-500 mb-4">
-          <Search :size="40" stroke-width="1.5" />
-        </div>
-        <p class="text-slate-800 font-medium mb-1">Enter a school name above to search</p>
-        <p class="text-sm text-slate-500">Start typing to find school permit information</p>
-      </div>
-
-      <!-- Result cards -->
-      <ul v-else class="space-y-4">
-        <li
-          v-for="group in searchResults"
-          :key="group.schoolId"
-          class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden"
-        >
-          <div class="p-5">
-            <div class="flex justify-between items-start mb-4">
-              <h3 class="font-semibold text-slate-800 text-lg">{{ group.schoolName }}</h3>
-              <span 
-                class="px-2 py-0.5 rounded text-xs font-medium border"
-                :class="{
-                  'bg-purple-50 text-purple-700 border-purple-200': group.schoolType === 'Private',
-                  'bg-blue-50 text-blue-700 border-blue-200': group.schoolType === 'Public',
-                  'bg-orange-50 text-orange-700 border-orange-200': group.schoolType === 'Homeschooling'
-                }"
-              >
-                {{ group.schoolType }}
-              </span>
-            </div>
-
-            <!-- List of permits for this school -->
-            <div class="space-y-4">
-              <div 
-                v-for="(p) in group.permits" 
-                :key="p.id" 
-                class="pt-4 first:pt-0 border-t border-slate-100 first:border-0"
-              >
-                <div class="flex flex-wrap gap-2 mb-2">
-                  <span
-                    v-for="level in p.levels"
-                    :key="level"
-                    :class="{
-                      'bg-emerald-100 text-emerald-800': getStatus(p.schoolYear).color === 'green',
-                      'bg-amber-100 text-amber-800': getStatus(p.schoolYear).color === 'yellow',
-                      'bg-red-100 text-red-800': getStatus(p.schoolYear).color === 'red',
-                      'bg-gray-100 text-gray-800': getStatus(p.schoolYear).color === 'gray',
-                    }"
-                    class="inline-flex items-center px-2.5 py-1 rounded-md text-sm font-medium"
-                  >
-                    {{ level }}: {{ getStatus(p.schoolYear).label }}
-                  </span>
-                </div>
-                
-                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-0">
-                  <div class="text-sm text-slate-600">
-                    <span v-if="p.permitNumber">Permit No. {{ p.permitNumber }}</span>
-                    <span v-if="p.permitNumber" class="hidden sm:inline text-slate-300 mx-2">|</span>
-                    <span :class="{'block text-xs text-slate-400 mt-1 sm:inline sm:text-sm sm:text-slate-600 sm:mt-0': p.permitNumber}">
-                      SY {{ p.schoolYear }}
-                    </span>
-                  </div>
-                  
-                  <button
-                    v-if="p.filePreviewUrl"
-                    type="button"
-                    @click="openPreview(p)"
-                    class="inline-flex items-center justify-center gap-2 px-3 py-1.5 text-sm font-medium text-sky-700 bg-sky-50 rounded-lg hover:bg-sky-100 transition-colors w-full sm:w-auto"
-                  >
-                    <FileImage :size="16" />
-                    View File
-                  </button>
-                  <span v-else class="text-sm text-slate-400 italic">No file attached</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </li>
-      </ul>
-    </main>
-
-    <!-- ─── Admin Dashboard view ───────────────────────────────────────────── -->
-    <main v-else class="max-w-4xl mx-auto px-4 py-8">
-      <h2 class="text-2xl font-bold text-slate-800 mb-1">Admin Dashboard</h2>
-      <p class="text-slate-600 mb-8">Manage schools and upload permit documents.</p>
-
-      <!-- Summary Dashboard (Toggleable) -->
-      <div class="mb-8">
-        <div class="flex items-center justify-between mb-4">
-           <h3 class="text-lg font-bold text-slate-800 flex items-center gap-2">
-             <LayoutDashboard class="w-5 h-5 text-sky-600" />
-             System Overview
-           </h3>
-           <button 
-             @click="showSummary = !showSummary"
-             class="text-sm text-sky-600 hover:text-sky-700 font-medium"
-           >
-             {{ showSummary ? 'Hide Summary' : 'Show Summary' }}
-           </button>
+      <!-- System Overview -->
+      <div class="mb-12">
+        <div class="flex items-center gap-2 mb-4">
+           <LayoutDashboard class="w-5 h-5 text-sky-600" />
+           <h3 class="text-lg font-bold text-slate-800">System Overview</h3>
         </div>
         
-        <div v-if="showSummary" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 animate-in fade-in slide-in-from-top-4 duration-300">
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 animate-in fade-in slide-in-from-top-4 duration-300">
            <!-- Total Schools -->
            <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
               <div class="p-3 bg-blue-50 text-blue-600 rounded-lg">
@@ -1206,7 +1310,7 @@ const showEmptyState = computed(() => {
               </div>
            </div>
            
-           <!-- Level Breakdown (Mini Chart Representation) -->
+           <!-- Level Breakdown -->
            <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-sm md:col-span-2">
               <div class="flex items-center gap-2 mb-3">
                  <BarChart3 class="w-5 h-5 text-slate-400" />
@@ -1222,15 +1326,179 @@ const showEmptyState = computed(() => {
         </div>
       </div>
 
-      <!-- Create New School card -->
+      <!-- Public Search Section -->
+      <div>
+         <div class="flex items-center gap-2 mb-6">
+            <Search class="w-5 h-5 text-sky-600" />
+            <h3 class="text-xl font-bold text-slate-800">Permit Search</h3>
+         </div>
+
+         <!-- Search Input & Filter -->
+         <div class="flex flex-col sm:flex-row gap-4 mb-8">
+            <div class="relative flex-1">
+              <Search
+                class="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400"
+                :size="20"
+              />
+              <input
+                v-model="rawSearchInput"
+                type="text"
+                placeholder="Search for a school..."
+                class="w-full pl-12 pr-4 py-3 rounded-lg border border-slate-300 bg-white focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none text-slate-800 placeholder-slate-400"
+              />
+            </div>
+            <CustomSelect
+              v-model="filterType"
+              :options="[
+                { value: 'All', label: 'All Types' },
+                { value: 'Private', label: 'Private' },
+                { value: 'Homeschooling', label: 'Homeschooling' }
+              ]"
+              class="w-48"
+            />
+         </div>
+
+         <!-- Loading State -->
+         <div v-if="isSearching" class="py-12 text-center">
+            <Loader2 class="animate-spin mx-auto text-sky-600 mb-4" :size="40" />
+            <p class="text-slate-600 font-medium">Searching...</p>
+         </div>
+
+         <!-- Empty state -->
+         <div
+            v-else-if="showEmptyState"
+            class="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center"
+         >
+            <div class="inline-flex items-center justify-center w-20 h-20 rounded-full bg-sky-50 text-sky-500 mb-4">
+              <Search :size="40" stroke-width="1.5" />
+            </div>
+            <p class="text-slate-800 font-medium mb-1">Enter a school name above to search</p>
+            <p class="text-sm text-slate-500">Start typing to find school permit information</p>
+         </div>
+
+         <!-- Result cards -->
+         <ul v-else class="space-y-4">
+            <li
+              v-for="group in searchResults"
+              :key="group.schoolId"
+              class="group bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden"
+            >
+              <div class="p-5">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between mb-4 gap-2">
+                  <div class="flex items-center gap-3">
+                    <h3 class="font-semibold text-slate-800 text-lg">{{ group.schoolName }}</h3>
+                    <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button @click="openEditSchool(group.schoolId)" class="p-1.5 text-slate-400 hover:text-sky-600 rounded-lg hover:bg-sky-50 transition-colors" title="Edit School">
+                        <Pencil :size="14" />
+                      </button>
+                      <button @click="deleteSchool(group.schoolId)" class="p-1.5 text-slate-400 hover:text-red-600 rounded-lg hover:bg-red-50 transition-colors" title="Delete School">
+                        <Trash2 :size="14" />
+                      </button>
+                    </div>
+                  </div>
+                  <div class="flex gap-2">
+                    <span 
+                      class="px-2 py-0.5 rounded text-xs font-medium border"
+                      :class="{
+                        'bg-purple-50 text-purple-700 border-purple-200': group.schoolType === 'Private',
+                        'bg-blue-50 text-blue-700 border-blue-200': group.schoolType === 'Public',
+                        'bg-orange-50 text-orange-700 border-orange-200': group.schoolType === 'Homeschooling'
+                      }"
+                    >
+                      {{ group.schoolType }}
+                    </span>
+                    <span 
+                      class="px-2 py-0.5 rounded text-xs font-medium border"
+                      :class="{
+                        'bg-emerald-50 text-emerald-700 border-emerald-200': getOverallSchoolStatus(group.permits).color === 'green',
+                        'bg-amber-50 text-amber-700 border-amber-200': getOverallSchoolStatus(group.permits).color === 'yellow',
+                        'bg-red-50 text-red-700 border-red-200': getOverallSchoolStatus(group.permits).color === 'red',
+                        'bg-gray-50 text-gray-700 border-gray-200': getOverallSchoolStatus(group.permits).color === 'gray'
+                      }"
+                    >
+                      Status: {{ getOverallSchoolStatus(group.permits).label }}
+                    </span>
+                  </div>
+                </div>
+
+                <!-- List of permits -->
+                <div class="space-y-4">
+                  <div 
+                    v-for="(p) in group.permits" 
+                    :key="p.id" 
+                    class="group/permit pt-4 first:pt-0 border-t border-slate-100 first:border-0"
+                  >
+                    <div class="flex flex-wrap gap-2 mb-2">
+                      <span
+                        v-for="level in p.levels"
+                        :key="level"
+                        :class="{
+                          'bg-emerald-100 text-emerald-800': getStatus(p.schoolYear).color === 'green',
+                          'bg-amber-100 text-amber-800': getStatus(p.schoolYear).color === 'yellow',
+                          'bg-red-100 text-red-800': getStatus(p.schoolYear).color === 'red',
+                          'bg-gray-100 text-gray-800': getStatus(p.schoolYear).color === 'gray',
+                        }"
+                        class="inline-flex items-center px-2.5 py-1 rounded-md text-sm font-medium"
+                      >
+                        {{ level }}: {{ getStatus(p.schoolYear).label }}
+                      </span>
+                    </div>
+                    
+                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-0">
+                      <div class="text-sm text-slate-600 flex items-center gap-2">
+                        <div class="flex flex-col sm:flex-row sm:items-center">
+                            <span v-if="p.permitNumber">Permit No. {{ p.permitNumber }}</span>
+                            <span v-if="p.permitNumber" class="hidden sm:inline text-slate-300 mx-2">|</span>
+                            <span :class="{'block text-xs text-slate-400 mt-1 sm:inline sm:text-sm sm:text-slate-600 sm:mt-0': p.permitNumber}">
+                              SY {{ p.schoolYear }}
+                            </span>
+                        </div>
+                        
+                        <div class="flex items-center gap-1 opacity-0 group-hover/permit:opacity-100 transition-opacity ml-2">
+                           <button @click="openEditPermit(p)" class="p-1 text-slate-400 hover:text-sky-600 transition-colors" title="Edit Permit">
+                              <Pencil :size="14" />
+                           </button>
+                           <button @click="deletePermit(p.id)" class="p-1 text-slate-400 hover:text-red-600 transition-colors" title="Delete Permit">
+                              <Trash2 :size="14" />
+                           </button>
+                        </div>
+                      </div>
+                      
+                      <button
+                        v-if="p.filePreviewUrl"
+                        type="button"
+                        @click="openPreview(p)"
+                        class="inline-flex items-center justify-center gap-2 px-3 py-1.5 text-sm font-medium text-sky-700 bg-sky-50 rounded-lg hover:bg-sky-100 transition-colors w-full sm:w-auto"
+                      >
+                        <FileImage :size="16" />
+                        View File
+                      </button>
+                      <span v-else class="text-sm text-slate-400 italic">No file attached</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </li>
+         </ul>
+      </div>
+    </main>
+
+    <!-- ─── Registration View ───────────────────────────────────────────── -->
+    <main v-else-if="currentView === 'registration'" class="max-w-4xl mx-auto px-4 py-8">
+      <div class="flex items-center gap-3 mb-6">
+         <div class="p-2 bg-sky-100 text-sky-600 rounded-lg">
+            <Plus :size="24" />
+         </div>
+         <div>
+            <h2 class="text-2xl font-bold text-slate-800">Registration</h2>
+            <p class="text-slate-600">Register new schools or homeschooling providers</p>
+         </div>
+      </div>
+
+      <!-- Registration Form Card -->
       <section class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 mb-6">
         <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
-          <div class="flex items-center gap-2">
-            <div class="p-1.5 rounded-lg bg-sky-100 text-sky-600">
-              <Plus :size="20" />
-            </div>
-            <h3 class="text-lg font-semibold text-slate-800">Registration</h3>
-          </div>
+          <h3 class="text-lg font-semibold text-slate-800">New Application</h3>
           
           <!-- Tabs -->
           <div class="flex bg-slate-100 p-1 rounded-lg self-start sm:self-auto">
@@ -1432,7 +1700,6 @@ const showEmptyState = computed(() => {
           </button>
         </form>
       </section>
-
     </main>
 
     <div
@@ -1512,6 +1779,102 @@ const showEmptyState = computed(() => {
         </div>
       </div>
     </Transition>
+    <!-- ─── Modals ──────────────────────────────────────────────────────── -->
+    
+    <!-- Edit School Modal -->
+    <div v-if="isEditingSchool" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div class="bg-white rounded-xl shadow-xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200">
+        <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center">
+          <h3 class="font-bold text-slate-800">Edit School</h3>
+          <button @click="isEditingSchool = false" class="text-slate-400 hover:text-slate-600">
+            <XCircle :size="20" />
+          </button>
+        </div>
+        <div class="p-6 space-y-4">
+          <div>
+            <label class="block text-sm font-medium text-slate-700 mb-1">School Name</label>
+            <input v-model="editSchoolForm.name" type="text" class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-slate-700 mb-1">Type</label>
+            <div class="flex gap-4">
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" v-model="editSchoolForm.type" value="Private" class="text-sky-600 focus:ring-sky-500" />
+                <span class="text-sm text-slate-700">Private</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" v-model="editSchoolForm.type" value="Public" class="text-sky-600 focus:ring-sky-500" />
+                <span class="text-sm text-slate-700">Public</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" v-model="editSchoolForm.type" value="Homeschooling" class="text-sky-600 focus:ring-sky-500" />
+                <span class="text-sm text-slate-700">Homeschooling</span>
+              </label>
+            </div>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-slate-700 mb-1">Address</label>
+            <input v-model="editSchoolForm.address" type="text" class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none" />
+          </div>
+        </div>
+        <div class="px-6 py-4 bg-slate-50 flex justify-end gap-3">
+          <button @click="isEditingSchool = false" class="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800">Cancel</button>
+          <button @click="saveEditSchool" class="px-4 py-2 text-sm font-medium text-white bg-sky-600 rounded-lg hover:bg-sky-700">Save Changes</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Edit Permit Modal -->
+    <div v-if="isEditingPermit" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div class="bg-white rounded-xl shadow-xl w-full max-w-lg overflow-hidden animate-in zoom-in-95 duration-200">
+        <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center">
+          <h3 class="font-bold text-slate-800">Edit Permit</h3>
+          <button @click="isEditingPermit = false" class="text-slate-400 hover:text-slate-600">
+            <XCircle :size="20" />
+          </button>
+        </div>
+        <div class="p-6 space-y-4 h-[60vh] overflow-y-auto">
+          <div>
+            <label class="block text-sm font-medium text-slate-700 mb-1">Permit Number</label>
+            <input v-model="editPermitForm.permitNumber" type="text" class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-slate-700 mb-1">School Year</label>
+            <input v-model="editPermitForm.schoolYear" type="text" class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none" placeholder="YYYY-YYYY" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-slate-700 mb-2">Levels</label>
+            <div class="grid grid-cols-2 gap-2">
+              <label 
+                v-for="opt in levelOptions" 
+                :key="opt.value" 
+                class="flex items-center gap-2 p-2 rounded border cursor-pointer hover:bg-slate-50"
+                :class="editPermitForm.levels.includes(opt.value) ? 'border-sky-500 bg-sky-50' : 'border-slate-200'"
+              >
+                <input 
+                  type="checkbox" 
+                  :value="opt.value" 
+                  class="rounded text-sky-600 focus:ring-sky-500"
+                  :checked="editPermitForm.levels.includes(opt.value)"
+                  @change="toggleEditPermitLevel(opt.value)"
+                >
+                <span class="text-sm text-slate-700">{{ opt.label }}</span>
+              </label>
+            </div>
+          </div>
+          <div>
+             <label class="block text-sm font-medium text-slate-700 mb-1">Replace File (Optional)</label>
+             <input type="file" @change="onEditPermitFileChange" class="block w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-sky-50 file:text-sky-700 hover:file:bg-sky-100" />
+             <p v-if="editPermitForm.fileName" class="mt-1 text-xs text-slate-500">Current: {{ editPermitForm.fileName }}</p>
+          </div>
+        </div>
+        <div class="px-6 py-4 bg-slate-50 flex justify-end gap-3">
+          <button @click="isEditingPermit = false" class="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800">Cancel</button>
+          <button @click="saveEditPermit" class="px-4 py-2 text-sm font-medium text-white bg-sky-600 rounded-lg hover:bg-sky-700">Save Changes</button>
+        </div>
+      </div>
+    </div>
+
   </div>
 </template>
 

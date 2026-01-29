@@ -139,6 +139,88 @@ app.post('/api/permits', upload.single('file'), (req, res) => {
   }
 });
 
+// Update a school
+app.put('/api/schools/:id', (req, res) => {
+  const { id } = req.params;
+  const { name, type, address } = req.body;
+  const sql = `UPDATE schools SET name = ?, type = ?, address = ? WHERE id = ?`;
+  db.run(sql, [name, type, address, id], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ id, name, type, address });
+  });
+});
+
+// Delete a school (and its permits)
+app.delete('/api/schools/:id', (req, res) => {
+  const { id } = req.params;
+  
+  // First delete associated permits
+  db.run(`DELETE FROM permits WHERE schoolId = ?`, [id], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    
+    // Then delete the school
+    db.run(`DELETE FROM schools WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: 'School and associated permits deleted' });
+    });
+  });
+});
+
+// Update a permit
+app.put('/api/permits/:id', upload.single('file'), (req, res) => {
+  try {
+    const { id } = req.params;
+    const { schoolId, levels, schoolYear, permitNumber, extractedText } = req.body;
+    
+    let fileUrl = null;
+    let originalName = null;
+    let sql = '';
+    let params = [];
+
+    // If a new file is uploaded, update file fields
+    if (req.file) {
+      fileUrl = `http://localhost:${PORT}/uploads/${req.file.filename}`;
+      originalName = req.file.originalname;
+      sql = `UPDATE permits SET schoolId = ?, levels = ?, schoolYear = ?, permitNumber = ?, extractedText = ?, filePath = ?, fileName = ? WHERE id = ?`;
+      params = [schoolId, levels, schoolYear, permitNumber, extractedText, fileUrl, originalName, id];
+    } else {
+      // If no new file, keep existing file info
+      sql = `UPDATE permits SET schoolId = ?, levels = ?, schoolYear = ?, permitNumber = ?, extractedText = ? WHERE id = ?`;
+      params = [schoolId, levels, schoolYear, permitNumber, extractedText, id];
+    }
+
+    db.run(sql, params, function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      
+      // We need to return the updated object. 
+      // If file was not updated, we should ideally fetch the old file path to return it, but frontend might not need it if it already has it.
+      // Let's just return what we updated.
+      res.json({
+        id,
+        schoolId,
+        levels: JSON.parse(levels),
+        schoolYear,
+        permitNumber,
+        extractedText,
+        filePreviewUrl: fileUrl, // might be null if not updated, frontend handles this
+        fileName: originalName
+      });
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete a permit
+app.delete('/api/permits/:id', (req, res) => {
+  const { id } = req.params;
+  db.run(`DELETE FROM permits WHERE id = ?`, [id], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ message: 'Permit deleted' });
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
 });
