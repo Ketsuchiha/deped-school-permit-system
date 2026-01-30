@@ -785,14 +785,17 @@ function extractPermitDetails(text) {
   }
   
   // Strategy 1: Standard Government Permit Pattern
-  // Matches: "Government Permit (Region IV-A) No. K-123 s. 2024" or "GP No. 123 s. 2023"
-  // Added flexibility for newlines/spacing (already flattened to ' ' in t)
-  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit)(?:\s+\(Region\s+[IVX\d\w-]+\))?\s+(?:No\.?|Number)\s*([A-Z0-9-]+)\s*s\.?\s*(\d{4})/gi
+  // Matches: "Government Permit (Region IV-A) No. K-123 s. 2024", "GP No. 123 s. 2023", "Authority to Operate No..."
+  // Added "Authority to Operate" and "DepEd Permit"
+  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s+\(Region\s+[IVX\d\w-]+\))?\s+(?:No\.?|Number)\s*([A-Z0-9\s-]+)\s*(?:s\.?|series\s+of)\s*(\d{4})/gi
   
   let match
   while ((match = gpRegex.exec(t)) !== null) {
     const pNum = match[1].trim()
     const sYear = match[2].trim()
+    
+    // Stop if pNum becomes too long (likely captured garbage text due to \s)
+    if (pNum.length > 20) continue
     
     const levels = []
     let strands = []
@@ -826,9 +829,10 @@ function extractPermitDetails(text) {
 
   // Strategy 2: Government Recognition Pattern
   // "GOVERNMENT RECOGNITION No. 001 s. 2020" or just "GOVERNMENT RECOGNITION ... for ... Course"
-  const grRegex = /Government\s+Recognition\s+(?:No\.?|Number)?\s*([A-Z0-9-]+)?\s*s\.?\s*(\d{4})/gi
+  const grRegex = /Government\s+Recognition\s+(?:No\.?|Number)?\s*([A-Z0-9\s-]+)?\s*(?:s\.?|series\s+of)\s*(\d{4})/gi
   while ((match = grRegex.exec(t)) !== null) {
-      const pNum = match[1] || 'Gov. Rec.'
+      const pNum = match[1] ? match[1].trim() : 'Gov. Rec.'
+      if (pNum.length > 20) continue
       const sYear = match[2]
       
       const levels = []
@@ -847,11 +851,11 @@ function extractPermitDetails(text) {
       })
   }
 
-  // Strategy 3: Loose "No. X-Y s. Z" if strictly prefixed (K-, E-, SHS-, JHS-)
+  // Strategy 3: Loose "No. X-Y s. Z" if strictly prefixed (K-, E-, SHS-, JHS-, S-)
   // Only if we haven't found much or to supplement
-  const looseRegex = /(?:No\.?|Number)\s*(K-\d+|E-\d+|JHS-\d+|SHS-\d+|S-\d+)\s*s\.?\s*(\d{4})/gi
+  const looseRegex = /(?:No\.?|Number)\s*(K-\s*\d+|E-\s*\d+|JHS-\s*\d+|SHS-\s*\d+|S-\s*\d+)\s*(?:s\.?|series\s+of)\s*(\d{4})/gi
   while ((match = looseRegex.exec(t)) !== null) {
-      const pNum = match[1].trim()
+      const pNum = match[1].replace(/\s+/g, '').trim()
       const sYear = match[2].trim()
       
       // Check if this permit is already found
