@@ -41,12 +41,20 @@ const db = new sqlite3.Database('./school_permits.db', (err) => {
     console.error('Error opening database:', err.message);
   } else {
     console.log('Connected to SQLite database.');
-    // Create tables
+    initDb();
+  }
+});
+
+function initDb() {
+  db.serialize(() => {
+    // Create tables if they don't exist
     db.run(`CREATE TABLE IF NOT EXISTS schools (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       type TEXT NOT NULL,
-      address TEXT
+      address TEXT,
+      deleted INTEGER DEFAULT 0,
+      deletedAt DATETIME
     )`);
 
     db.run(`CREATE TABLE IF NOT EXISTS permits (
@@ -59,16 +67,34 @@ const db = new sqlite3.Database('./school_permits.db', (err) => {
       filePath TEXT,
       fileName TEXT,
       createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+      deleted INTEGER DEFAULT 0,
+      deletedAt DATETIME,
       FOREIGN KEY(schoolId) REFERENCES schools(id)
     )`);
-  }
-});
+
+    // Migration: Add deleted/deletedAt columns if missing (safe to run multiple times)
+    const columns = ['deleted', 'deletedAt'];
+    const tables = ['schools', 'permits'];
+    
+    tables.forEach(table => {
+      columns.forEach(col => {
+        const type = col === 'deleted' ? 'INTEGER DEFAULT 0' : 'DATETIME';
+        db.run(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`, (err) => {
+          // Ignore error if column already exists
+          if (err && !err.message.includes('duplicate column name')) {
+            // console.log(`Column ${col} already exists in ${table} or error:`, err.message);
+          }
+        });
+      });
+    });
+  });
+}
 
 // ─── API Endpoints ─────────────────────────────────────────────
 
-// Get all schools
+// Get all active schools
 app.get('/api/schools', (req, res) => {
-  db.all("SELECT * FROM schools", [], (err, rows) => {
+  db.all("SELECT * FROM schools WHERE deleted = 0 OR deleted IS NULL", [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows);
   });
@@ -77,21 +103,21 @@ app.get('/api/schools', (req, res) => {
 // Create a school
 app.post('/api/schools', (req, res) => {
   const { id, name, type, address } = req.body;
-  const sql = `INSERT INTO schools (id, name, type, address) VALUES (?, ?, ?, ?)`;
+  const sql = `INSERT INTO schools (id, name, type, address, deleted) VALUES (?, ?, ?, ?, 0)`;
   db.run(sql, [id, name, type, address], function(err) {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ id, name, type, address });
+    res.json({ id, name, type, address, deleted: 0 });
   });
 });
 
-// Get all permits
+// Get all active permits
 app.get('/api/permits', (req, res) => {
-  db.all("SELECT * FROM permits", [], (err, rows) => {
+  db.all("SELECT * FROM permits WHERE deleted = 0 OR deleted IS NULL", [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     // Parse levels back to array
     const permits = rows.map(p => ({
       ...p,
-      levels: JSON.parse(p.levels),
+      levels: JSON.parse(p.levels || '[]'),
       filePreviewUrl: p.filePath
     }));
     res.json(permits);
@@ -103,9 +129,6 @@ app.post('/api/permits', upload.single('file'), (req, res) => {
   try {
     const { id, schoolId, levels, schoolYear, permitNumber, extractedText } = req.body;
     
-    // For Homeschooling, file might be optional (application data only)
-    // We won't strictly enforce file presence here, but frontend should for non-homeschooling.
-    
     let fileUrl = null;
     let filePath = null;
     let originalName = null;
@@ -116,21 +139,20 @@ app.post('/api/permits', upload.single('file'), (req, res) => {
       originalName = req.file.originalname;
     }
     
-    const sql = `INSERT INTO permits (id, schoolId, levels, schoolYear, permitNumber, extractedText, filePath, fileName) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
-    
-    // Levels comes as a stringified JSON from frontend or form-data
+    const sql = `INSERT INTO permits (id, schoolId, levels, schoolYear, permitNumber, extractedText, filePath, fileName, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`;
     
     db.run(sql, [id, schoolId, levels, schoolYear, permitNumber, extractedText, fileUrl, originalName], function(err) {
       if (err) return res.status(500).json({ error: err.message });
       res.json({
         id,
         schoolId,
-        levels: JSON.parse(levels),
+        levels: JSON.parse(levels || '[]'),
         schoolYear,
         permitNumber,
         extractedText,
         filePreviewUrl: fileUrl,
-        fileName: originalName
+        fileName: originalName,
+        deleted: 0
       });
     });
 
@@ -150,18 +172,19 @@ app.put('/api/schools/:id', (req, res) => {
   });
 });
 
-// Delete a school (and its permits)
+// Soft Delete a school (and its permits)
 app.delete('/api/schools/:id', (req, res) => {
   const { id } = req.params;
+  const now = new Date().toISOString();
   
-  // First delete associated permits
-  db.run(`DELETE FROM permits WHERE schoolId = ?`, [id], (err) => {
+  // Soft delete permits first
+  db.run(`UPDATE permits SET deleted = 1, deletedAt = ? WHERE schoolId = ?`, [now, id], (err) => {
     if (err) return res.status(500).json({ error: err.message });
     
-    // Then delete the school
-    db.run(`DELETE FROM schools WHERE id = ?`, [id], function(err) {
+    // Then soft delete the school
+    db.run(`UPDATE schools SET deleted = 1, deletedAt = ? WHERE id = ?`, [now, id], function(err) {
       if (err) return res.status(500).json({ error: err.message });
-      res.json({ message: 'School and associated permits deleted' });
+      res.json({ message: 'School and associated permits moved to trash' });
     });
   });
 });
@@ -191,18 +214,14 @@ app.put('/api/permits/:id', upload.single('file'), (req, res) => {
 
     db.run(sql, params, function(err) {
       if (err) return res.status(500).json({ error: err.message });
-      
-      // We need to return the updated object. 
-      // If file was not updated, we should ideally fetch the old file path to return it, but frontend might not need it if it already has it.
-      // Let's just return what we updated.
       res.json({
         id,
         schoolId,
-        levels: JSON.parse(levels),
+        levels: JSON.parse(levels || '[]'),
         schoolYear,
         permitNumber,
         extractedText,
-        filePreviewUrl: fileUrl, // might be null if not updated, frontend handles this
+        filePreviewUrl: fileUrl, 
         fileName: originalName
       });
     });
@@ -212,14 +231,126 @@ app.put('/api/permits/:id', upload.single('file'), (req, res) => {
   }
 });
 
-// Delete a permit
+// Soft Delete a permit
 app.delete('/api/permits/:id', (req, res) => {
   const { id } = req.params;
-  db.run(`DELETE FROM permits WHERE id = ?`, [id], function(err) {
+  const now = new Date().toISOString();
+  db.run(`UPDATE permits SET deleted = 1, deletedAt = ? WHERE id = ?`, [now, id], function(err) {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ message: 'Permit deleted' });
+    res.json({ message: 'Permit moved to trash' });
   });
 });
+
+// ─── Trash Endpoints ─────────────────────────────────────────────
+
+// Get all trash items
+app.get('/api/trash', (req, res) => {
+  const result = { schools: [], permits: [] };
+  
+  db.all("SELECT * FROM schools WHERE deleted = 1", [], (err, schoolRows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    result.schools = schoolRows;
+    
+    db.all("SELECT * FROM permits WHERE deleted = 1", [], (err, permitRows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      
+      result.permits = permitRows.map(p => ({
+        ...p,
+        levels: JSON.parse(p.levels || '[]'),
+        filePreviewUrl: p.filePath
+      }));
+      
+      res.json(result);
+    });
+  });
+});
+
+// Restore item
+app.post('/api/restore/:type/:id', (req, res) => {
+  const { type, id } = req.params;
+  const table = type === 'school' ? 'schools' : 'permits';
+  
+  // If restoring a school, also restore its permits that were deleted at the same time?
+  // Or just restore the school.
+  // Requirement: "restore... successfully restore too". 
+  // If I restore a school, I should probably restore its permits if they were deleted with it.
+  // But distinguishing which permits were deleted *with* the school vs deleted individually is hard without a batch ID.
+  // Simplified logic: If restoring school, restore all its currently deleted permits.
+  // Or just restore the school and let user restore permits manually?
+  // User said: "when it deleted the School name with the Permit it should show on the trashbin page and had action to restore and would successfully restore too."
+  // This implies restoring the school should bring back its permits.
+  
+  if (type === 'school') {
+    db.run(`UPDATE schools SET deleted = 0, deletedAt = NULL WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      
+      // Also restore permits for this school
+      db.run(`UPDATE permits SET deleted = 0, deletedAt = NULL WHERE schoolId = ? AND deleted = 1`, [id], (err) => {
+        if (err) console.error('Error restoring permits:', err);
+        res.json({ message: 'School and permits restored' });
+      });
+    });
+  } else {
+    // Restore single permit
+    db.run(`UPDATE permits SET deleted = 0, deletedAt = NULL WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: 'Permit restored' });
+    });
+  }
+});
+
+// Delete forever
+app.delete('/api/trash/:type/:id', (req, res) => {
+  const { type, id } = req.params;
+  const table = type === 'school' ? 'schools' : 'permits';
+  
+  if (type === 'school') {
+    // Delete permits first
+    db.run(`DELETE FROM permits WHERE schoolId = ?`, [id], (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      
+      db.run(`DELETE FROM schools WHERE id = ?`, [id], function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ message: 'School permanently deleted' });
+      });
+    });
+  } else {
+    db.run(`DELETE FROM permits WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: 'Permit permanently deleted' });
+    });
+  }
+});
+
+// ─── Auto Cleanup (15 days) ──────────────────────────────────────
+const CLEANUP_INTERVAL = 1000 * 60 * 60; // Check every hour
+setInterval(() => {
+  const limitDate = new Date();
+  limitDate.setDate(limitDate.getDate() - 15);
+  const limitStr = limitDate.toISOString();
+  
+  // Delete old permits
+  db.run(`DELETE FROM permits WHERE deleted = 1 AND deletedAt < ?`, [limitStr], function(err) {
+    if (err) console.error('Auto-cleanup permits error:', err);
+    else if (this.changes > 0) console.log(`Auto-cleaned ${this.changes} permits`);
+  });
+
+  // Delete old schools (cascade to permits already handled if logic is sound, but permits are separate table)
+  // We need to delete schools, but first ensure their permits are gone.
+  // Actually, we should check schools.
+  db.all(`SELECT id FROM schools WHERE deleted = 1 AND deletedAt < ?`, [limitStr], (err, rows) => {
+    if (err) return;
+    rows.forEach(row => {
+      // Delete associated permits first
+      db.run(`DELETE FROM permits WHERE schoolId = ?`, [row.id]);
+      // Delete school
+      db.run(`DELETE FROM schools WHERE id = ?`, [row.id]);
+    });
+    if (rows.length > 0) console.log(`Auto-cleaned ${rows.length} schools`);
+  });
+  
+}, CLEANUP_INTERVAL);
+
 
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);

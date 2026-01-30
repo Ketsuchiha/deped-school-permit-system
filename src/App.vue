@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue'
-import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2 } from 'lucide-vue-next'
+import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2, RotateCcw } from 'lucide-vue-next'
 import Tesseract from 'tesseract.js'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
@@ -67,6 +67,8 @@ async function refreshData() {
     ])
     if (schoolsRes.ok) schools.value = await schoolsRes.json()
     if (permitsRes.ok) permits.value = await permitsRes.json()
+    // Fetch trash count for dashboard
+    fetchTrash()
   } catch (error) {
     console.error('Failed to fetch data:', error)
   }
@@ -89,6 +91,7 @@ async function deleteSchool(schoolId) {
     if (res.ok) {
       showToast('School deleted successfully', 'success')
       refreshData()
+      triggerTrashAnim()
     } else {
       throw new Error('Failed to delete')
     }
@@ -142,6 +145,7 @@ async function deletePermit(permitId) {
     if (res.ok) {
       showToast('Permit deleted successfully', 'success')
       refreshData()
+      triggerTrashAnim()
     } else {
       throw new Error('Failed to delete')
     }
@@ -219,6 +223,92 @@ const levelOptions = [
   { value: 'Senior High School', label: 'Senior High School' },
 ]
 
+// ─── Trash Bin Logic ─────────────────────────────────────────────────────────
+const trashTab = ref('schools')
+const trashSchools = ref([])
+const trashPermits = ref([])
+const trashLoading = ref(false)
+const trashAnimating = ref(false)
+
+const trashCount = computed(() => trashSchools.value.length + trashPermits.value.length)
+
+watch(currentView, (newVal) => {
+  if (newVal === 'trash') fetchTrash()
+})
+
+async function fetchTrash() {
+  trashLoading.value = true
+  try {
+    const res = await fetch(`${API_URL}/trash`)
+    if (res.ok) {
+      const data = await res.json()
+      trashSchools.value = data.schools || []
+      trashPermits.value = data.permits || []
+    }
+  } catch (err) {
+    console.error('Failed to fetch trash:', err)
+  } finally {
+    trashLoading.value = false
+  }
+}
+
+function triggerTrashAnim() {
+  trashAnimating.value = true
+  setTimeout(() => {
+    trashAnimating.value = false
+  }, 1000)
+}
+
+function getSchoolName(schoolId) {
+  // Check active schools
+  const active = schools.value.find(s => s.id === schoolId)
+  if (active) return active.name
+  // Check trash schools
+  const trash = trashSchools.value.find(s => s.id === schoolId)
+  if (trash) return trash.name + ' (Deleted)'
+  return 'Unknown School'
+}
+
+function getSchoolAddress(schoolId) {
+  const active = schools.value.find(s => s.id === schoolId)
+  if (active) return active.address
+  const trash = trashSchools.value.find(s => s.id === schoolId)
+  if (trash) return trash.address
+  return ''
+}
+
+async function restoreItem(type, id) {
+  try {
+    const res = await fetch(`${API_URL}/restore/${type}/${id}`, { method: 'POST' })
+    if (res.ok) {
+      showToast('Item restored successfully', 'success')
+      fetchTrash()
+      refreshData() // Refresh active data
+    } else {
+      throw new Error('Failed to restore')
+    }
+  } catch (err) {
+    showToast('Failed to restore item', 'error')
+  }
+}
+
+async function deleteForever(type, id) {
+  const confirmed = await confirmAction('Are you sure? This action cannot be undone.')
+  if (!confirmed) return
+
+  try {
+    const res = await fetch(`${API_URL}/trash/${type}/${id}`, { method: 'DELETE' })
+    if (res.ok) {
+      showToast('Item permanently deleted', 'success')
+      fetchTrash()
+    } else {
+      throw new Error('Failed to delete')
+    }
+  } catch (err) {
+    showToast('Failed to delete item', 'error')
+  }
+}
+
 // ─── Create New School ──────────────────────────────────────────────────────
 const schoolForm = ref({
   name: '',
@@ -293,12 +383,10 @@ async function onSchoolFileChange(e) {
     const permitHeaderMatch = text.match(/(?:GOVERNMENT\s+(?:RECOGNITION|PERMIT)|AUTHORITY\s+TO\s+OPERATE)/i)
     
     if (permitHeaderMatch) {
-       // Focus analysis starting from the Permit header
-       // We keep a bit of context before just in case, but mainly look forward
        textToAnalyze = text.substring(permitHeaderMatch.index)
     }
 
-    // Block signatures (Clean text) from the relevant section
+    // Block signatures (Clean text)
     const signatureMarkers = [
       /Approved\s+by:/i,
       /Signed\s+by:/i,
@@ -322,25 +410,32 @@ async function onSchoolFileChange(e) {
     const lines = cleanTextForName.split('\n').map(l => l.trim()).filter(l => l)
     
     // Find School Name
-    const schoolKeywords = ['School', 'Academy', 'College', 'Institute', 'University', 'Montessori', 'Learning Center']
+    const schoolKeywords = ['School', 'Academy', 'College', 'Institute', 'University', 'Montessori', 'Learning Center', 'Lyceum']
     let foundName = ''
     
-    // Strategy 0: Government Recognition "To <Name>" Pattern
-    // Image format: "To \n SCHOLA ANGELICUS \n (School)"
-    const toMatch = cleanTextForName.match(/To\s*\n+([A-Z\s.,&'-]+?)(?:\n+\(School\))?(?:\n|$)/i)
-    if (toMatch && toMatch[1] && !toMatch[1].includes('Regional Director')) {
-        foundName = toMatch[1].trim()
+    // Strategy 1: "To [Name]" Pattern (Strongest)
+    // Matches "To \n SCHOLA ANGELICUS \n (School)" or just "To: SCHOLA..."
+    const toMatch = cleanTextForName.match(/(?:^|\n)(?:To|Issued\s+to|Granted\s+to)[:\s]*\n*([A-Z0-9\s.,&'-]+?)(?:\n+\(School\)|\s+located\s+at|\s+to\s+operate|\s+for\s+the|\n|$)/i)
+    if (toMatch && toMatch[1]) {
+        const candidate = toMatch[1].trim()
+        if (!candidate.includes('Regional Director') && candidate.length > 3) {
+           foundName = candidate
+        }
     }
     
-    // Strategy 0.1: Look-Behind for "(School)" label
-    // If regex failed (maybe due to missing newlines or noise), iterate lines to find the label
+    // Strategy 2: "The [Name] located at" Pattern
+    if (!foundName) {
+       const theMatch = cleanTextForName.match(/The\s+([A-Z0-9\s.,&'-]+?)\s+located\s+at/i)
+       if (theMatch && theMatch[1]) foundName = theMatch[1].trim()
+    }
+
+    // Strategy 3: Explicit Labels "(School)" or "(Name of School)"
     if (!foundName) {
        for (let i = 0; i < lines.length; i++) {
           const line = lines[i].trim()
-          // Look for line containing exactly "(School)" or close to it
-          if (/\(School\)/i.test(line)) {
+          // Look for line containing exactly "(School)"
+          if (/\(School\)/i.test(line) || /\(Name of School\)/i.test(line)) {
              // The name should be on the previous line (i-1)
-             // Check if previous line exists and is not "To"
              if (i > 0) {
                 const prevLine = lines[i-1].trim()
                 if (prevLine && !/^To$/i.test(prevLine) && prevLine.length > 3) {
@@ -352,97 +447,44 @@ async function onSchoolFileChange(e) {
        }
     }
 
-    // Strategy 0.5: Government Permit "granted to <Name>" Pattern
-    // Format: "...is hereby granted to [SCHOOL NAME] located at [ADDRESS]"
     if (!foundName) {
-       // We look for "granted to" followed by capitalized words (the name)
-       // We stop at "to operate", "located at", "for the", or "Course"
-       const grantedMatch = cleanTextForName.match(/granted\s+to\s+([A-Z0-9\s.,&'-]+?)(?:\s+to\s+operate|\s+located\s+at|\s+for\s+the|\s*,?\s*Region)/i)
-       if (grantedMatch && grantedMatch[1]) {
-          const candidate = grantedMatch[1].trim()
-          // Filter out false positives like "Schools Division Superintendent" if it somehow appears here
-          if (!candidate.includes('Superintendent') && !candidate.includes('Director')) {
-             foundName = candidate
-          }
-       }
-    }
-
-    if (!foundName) {
-      // Strategy 1: Explicit labels
-    for (let i = 0; i < lines.length - 1; i++) {
-       const nextLine = lines[i+1].toLowerCase().replace(/\s/g, '')
-       if (nextLine.includes('(school)') || nextLine.includes('(nameofschool)')) {
-          foundName = lines[i]
-          break
-       }
-    }
-    }
-
-    if (!foundName) {
-      const grantMatch = text.match(/(?:hereby\s+)?granted\s+to\s+([A-Z\s.,&'-]+?)(?:\s+to\s+operate|\s*located)/i)
-      const theMatch = text.match(/The\s+([A-Z\s.,&'-]+?)\s+located\s+at/i)
-      const explicitNameMatch = text.match(/(?:Name\s+of\s+School|School\s+Name)\s*[:.]?\s*([A-Z\s.,&'-]+)/i)
-
-      if (grantMatch && grantMatch[1]) {
-         foundName = grantMatch[1].trim()
-      } else if (theMatch && theMatch[1]) {
-         foundName = theMatch[1].trim()
-      } else if (explicitNameMatch && explicitNameMatch[1]) {
-         foundName = explicitNameMatch[1].trim()
-      } else {
-         const endorsementLine = lines.find(l => l.match(/Respectfully\s+endorsed\s+to/i))
-         if (endorsementLine) {
-            const match = endorsementLine.match(/(?:Administrator|Principal|Head|Director)\s+of\s+(?:the\s+)?(.*)/i)
-            if (match && match[1]) {
-               foundName = match[1].trim()
-            } else {
-               foundName = endorsementLine
-            }
-         } else {
-             // Fallback: Only accept if it looks very much like a school name and isn't a header
-             for (const line of lines) {
-               if (line.match(/^(Respectfully|This\s+permit|Pursuant|Republic|Department|Region|Division|Office)/i)) continue
-               // Must contain a keyword AND not be a sentence
-               if (schoolKeywords.some(k => line.includes(k)) && line.length < 80 && !line.includes('...')) {
-                  // Additional check: Should not start with "To:" or "From:"
-                  if (/^(To|From|Subject|Attention):/i.test(line)) continue
-                  
-                  foundName = line
-                  break
-               }
-             }
+      // Fallback: Scan lines for keywords, excluding headers/sentences
+      for (const line of lines) {
+         if (line.match(/^(Respectfully|This\s+permit|Pursuant|Republic|Department|Region|Division|Office|Subject|To:|From:)/i)) continue
+         if (line.length > 80 || line.includes('...')) continue
+         
+         if (schoolKeywords.some(k => line.includes(k))) {
+            foundName = line
+            break
          }
       }
     }
     
     if (foundName) {
+      // Cleanup
       const prefixMatch = foundName.match(/(?:Administrator|Principal|Head|Director)\s+of\s+(?:the\s+)?(.*)/i)
       if (prefixMatch && prefixMatch[1]) foundName = prefixMatch[1].trim()
       foundName = foundName.replace(/^Respectfully\s+endorsed\s+to\s+/i, '')
       foundName = foundName.replace(/[,.]+$/, '')
     }
     
-    // Find Address (Refined for "City, Province" without unnecessary words)
+    // Find Address
     let foundAddress = ''
     
-    // Strategy 0: Address between "(School)" and "(Complete Address)"
-    // Matches "SCHOLA ANGELICUS \n (School) \n St. Joseph Village 7... \n (Complete Address)"
-    // We look for text AFTER (School) and BEFORE (Complete Address)
-    const addressBetweenMatch = cleanTextForName.match(/\(School\)\s*\n+([^\n]+)(?:\n+\(Complete Address\))?/i)
-    if (addressBetweenMatch && addressBetweenMatch[1]) {
-       foundAddress = addressBetweenMatch[1].trim()
+    // Strategy 1: "located at [Address]" (Strongest)
+    const locatedMatch = cleanTextForName.match(/located\s+at\s+([A-Z0-9\s.,&'-]+?)(?:\s+(?:approving|approves|granting|granted|hereby|which|where|to\s+operate|subject\s+to|pursuant|under|following|\(School\))|$)/i)
+    if (locatedMatch && locatedMatch[1]) {
+       foundAddress = locatedMatch[1].trim().replace(/[.,;:]+$/, '')
     }
     
-    // Strategy 0.1: Look-Behind for "(Complete Address)" label
+    // Strategy 2: Explicit Labels "(Complete Address)" or "(Address)"
     if (!foundAddress) {
        for (let i = 0; i < lines.length; i++) {
           const line = lines[i].trim()
-          if (/\(Complete Address\)/i.test(line)) {
-             // The address should be on the previous line (i-1)
+          if (/\(Complete Address\)/i.test(line) || /\(Address\)/i.test(line)) {
              if (i > 0) {
                 const prevLine = lines[i-1].trim()
-                // Ensure it's not the School label line if spacing is tight (unlikely but possible)
-                if (prevLine && !/\(School\)/i.test(prevLine)) {
+                if (prevLine && prevLine !== foundName) {
                    foundAddress = prevLine
                    break
                 }
@@ -451,66 +493,20 @@ async function onSchoolFileChange(e) {
        }
     }
 
-    // Strategy 0.5: Government Permit "located at <Address>" Pattern
-    // Often follows the school name: "...granted to [Name] located at [Address]..."
+    // Strategy 3: Scan for City/Province
     if (!foundAddress) {
-       // Look for "located at" and capture until a stop word or end of line
-       const locatedMatch = cleanTextForName.match(/located\s+at\s+([A-Z0-9\s.,&'-]+?)(?:\s+(?:approving|approves|granting|granted|hereby|which|where|to\s+operate|subject\s+to|pursuant|under|following)|$)/i)
-       if (locatedMatch && locatedMatch[1]) {
-          let addr = locatedMatch[1].trim()
-          // Clean up trailing punctuation
-          addr = addr.replace(/[.,;:]+$/, '')
-          // Must be substantial
-          if (addr.length > 5 && /\d+|Street|St\.|Ave|City|Province|Brgy|Barangay/i.test(addr)) {
-             foundAddress = addr
-          }
-       }
-    }
-
-    if (!foundAddress) {
-    // Strategy 1: Explicit labels
-    for (let i = 0; i < lines.length - 1; i++) {
-       const nextLine = lines[i+1].toLowerCase().replace(/\s/g, '')
-       if (nextLine.includes('(completeaddress)') || nextLine.includes('(address)')) {
-          foundAddress = lines[i]
-          break
-       }
-    }
-    }
-
-    if (!foundAddress) {
-      // Look for line ending with "City" or "Province" or typical address format
-      // Exclude headers starting with Department, Republic, Region, Division
-      const addressBlockList = /^(Department|Republic|Region|Division|Office|District|Subject|To:|From:)/i
-      
-      // Strategy 2: Scan lines for City/Province
+      const addressBlockList = /^(Department|Republic|Region|Division|Office|District|Subject|To:|From:|The)/i
       for (const line of lines) {
         if (line.includes(foundName)) continue
         if (addressBlockList.test(line)) continue
-        if (line.match(/^Respectfully\s+endorsed/i)) continue
         
-        // Check for City/Province presence
-        // Ensure it's not just "City Schools Division" or "Division of City"
-        const hasCity = /\bCity\b/.test(line) && !/City\s+Schools\s+Division/i.test(line) && !/Division\s+of/i.test(line)
-        const hasProvince = /\bProvince\b/.test(line) && !/Province\s+of/i.test(line) // Avoid "Province of Laguna" header alone if possible, though usually address includes it.
-        const hasStreet = /\bSt\.\s/.test(line) || line.includes('Street') || line.includes('Subd') || line.includes('Brgy') || line.includes('Barangay')
+        const hasCity = /\bCity\b/.test(line) && !/City\s+Schools\s+Division/i.test(line)
+        const hasProvince = /\bProvince\b/.test(line) && !/Province\s+of/i.test(line)
+        const hasStreet = /\b(St\.|Street|Ave|Avenue|Rd|Road|Brgy|Barangay|Subd|Subdivision|Village)\b/i.test(line)
         
         if (hasCity || hasProvince || hasStreet) {
-           // Clean up unnecessary words if present
            let cleaned = line.replace(/^(located at|address[:.]?)\s*/i, '')
-           
-           // Truncate text that looks like the start of a sentence or legal clause
-           // Matches "... City, Laguna, approving the herein..." -> "... City, Laguna"
-           const stopWordsRegex = /[,.]?\s+(approving|approves|granting|granted|hereby|which|where|to\s+operate|is\s+located|subject\s+to|pursuant|under|following|endorsed|indorsed|recommending)\b/i
-           const stopMatch = cleaned.match(stopWordsRegex)
-           if (stopMatch) {
-              cleaned = cleaned.substring(0, stopMatch.index).trim()
-           }
-
-           // Remove trailing punctuation
            cleaned = cleaned.replace(/[.,;:]+$/, '')
-
-           // If it looks like a valid address (has numbers or multiple words)
            if (cleaned.split(' ').length > 2) {
               foundAddress = cleaned
               break
@@ -788,133 +784,105 @@ function extractPermitDetails(text) {
     return found
   }
   
-  // Strict Government Permit Pattern
+  // Strategy 1: Standard Government Permit Pattern
   // Matches: "Government Permit (Region IV-A) No. K-123 s. 2024" or "GP No. 123 s. 2023"
-  const gpRegex = /(?:Government\s+Permit|GP)(?:\s+\(Region\s+[IVX\d\w-]+\))?\s+No\.?\s*([A-Z0-9-]+)\s*s\.?\s*(\d{4})/gi
+  // Added flexibility for newlines/spacing (already flattened to ' ' in t)
+  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit)(?:\s+\(Region\s+[IVX\d\w-]+\))?\s+(?:No\.?|Number)\s*([A-Z0-9-]+)\s*s\.?\s*(\d{4})/gi
   
-  // Special Case: Government Recognition (No Permit Number usually, but effectively a permit)
-  // Format: "GOVERNMENT RECOGNITION ... for the Complete Elementary Course ... effective as of SY 2018 - 2019"
-  // Also supports "Government Recognition No. 123 s. 2020" if present
-  if (/GOVERNMENT\s+RECOGNITION/i.test(t)) {
-     // Try to find a number if it exists
-     const grNumMatch = t.match(/Government\s+Recognition\s+(?:No\.?)?\s*([A-Z0-9-]+)\s*s\.?\s*(\d{4})/i)
-     
-     // Extract SY (Priority to "effective as of SY")
-     const syMatch = t.match(/effective\s+as\s+of\s+SY\s+(\d{4}\s*[-–]\s*\d{4})/i)
-     const grSy = syMatch ? syMatch[1].replace(/\s/g, '') : (grNumMatch ? grNumMatch[2] : '')
-     
-     // Extract Course/Level
-     const courseMatch = t.match(/for\s+the\s+([A-Za-z\s]+?)\s+Course/i)
-     const rawCourse = courseMatch ? courseMatch[1] : ''
-     
-     const levels = []
-     if (/Kindergarten/i.test(rawCourse)) levels.push('Kindergarten')
-     if (/Elementary/i.test(rawCourse)) levels.push('Elementary')
-     if (/Junior\s*High/i.test(rawCourse)) levels.push('Junior High School')
-     if (/Senior\s*High/i.test(rawCourse)) levels.push('Senior High School')
-     
-     // If we found a valid SY and Levels, add it
-     if (grSy && levels.length > 0) {
-        permits.push({
-           permitNumber: grNumMatch ? grNumMatch[1] : 'Gov. Recognition',
-           schoolYear: grSy,
-           levels: levels,
-           strands: []
-        })
-     }
-  }
-
   let match
   while ((match = gpRegex.exec(t)) !== null) {
     const pNum = match[1].trim()
     const sYear = match[2].trim()
     
-    // Infer Level from Permit Number Prefix
     const levels = []
     let strands = []
     
-    // User Requirement: K=Kindergarten, E=Elementary, S=Junior High, SHS=Senior High
-    // Strict Prefix Check
+    // Infer Level from Permit Number Prefix
     if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
     else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
     else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School') 
     else if (/^SHS[-]/i.test(pNum)) levels.push('Senior High School')
     
-    // If we have a strict prefix match, we trust it completely.
-    // Only if NO prefix is found do we look at context, but we must be careful.
+    // Context fallback (look around the match)
     if (levels.length === 0) {
-       // Check if the number itself implies a level (e.g. if the user says it starts with these, maybe some don't have hyphens?)
-       // But assuming hyphenated standard: "K-...", "E-..."
-       
-       // Context fallback (only if prefix is missing)
-       const context = t.substring(Math.max(0, match.index - 200), match.index + 100)
+       const context = t.substring(Math.max(0, match.index - 300), match.index + 300)
        if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
        if (/Elementary/i.test(context)) levels.push('Elementary')
        if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
        if (/Senior\s*High/i.test(context)) levels.push('Senior High School')
     }
 
-    // Detect Strands if SHS is involved
     if (levels.includes('Senior High School')) {
-       strands = detectStrands(t)
+       strands = detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 500))
     }
 
     permits.push({
       permitNumber: pNum,
       schoolYear: sYear,
-      levels: levels,
+      levels: [...new Set(levels)], // Dedupe
       strands: strands
     })
   }
 
-  // Fallback: If no strict "Government Permit" found, try looser extraction for single permit
-  if (permits.length === 0) {
-      // Use previous logic but stricter
-      const loosePermits = []
+  // Strategy 2: Government Recognition Pattern
+  // "GOVERNMENT RECOGNITION No. 001 s. 2020" or just "GOVERNMENT RECOGNITION ... for ... Course"
+  const grRegex = /Government\s+Recognition\s+(?:No\.?|Number)?\s*([A-Z0-9-]+)?\s*s\.?\s*(\d{4})/gi
+  while ((match = grRegex.exec(t)) !== null) {
+      const pNum = match[1] || 'Gov. Rec.'
+      const sYear = match[2]
       
-      // Look for standalone permit numbers with prefixes
-      const patterns = [
-        { regex: /(SHS\s*-\s*\d+)/i, level: 'Senior High School' },
-        { regex: /(JHS\s*-\s*\d+)/i, level: 'Junior High School' },
-        { regex: /(S\s*-\s*\d+)/i, level: 'Junior High School' },
-        { regex: /(K\s*-\s*\d+)/i, level: 'Kindergarten' },
-        { regex: /(E\s*-\s*\d+)/i, level: 'Elementary' }
-      ]
+      const levels = []
+      const context = t.substring(Math.max(0, match.index - 300), match.index + 300)
       
-      // Look for School Year
-      const syMatch = t.match(/s\.?\s*(\d{4})/i) || t.match(/(\d{4})\s*[-–]\s*(\d{4})/i)
-      const foundYear = syMatch ? (syMatch[2] ? `${syMatch[1]}-${syMatch[2]}` : syMatch[1]) : ''
-      
-      for (const p of patterns) {
-         const m = t.match(p.regex)
-         if (m) {
-            let strands = []
-            if (p.level === 'Senior High School') {
-               strands = detectStrands(t)
-            }
+      if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
+      if (/Elementary/i.test(context)) levels.push('Elementary')
+      if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
+      if (/Senior\s*High/i.test(context)) levels.push('Senior High School')
 
-            loosePermits.push({
-               permitNumber: m[1].replace(/\s/g, ''),
-               schoolYear: foundYear,
-               levels: [p.level],
-               strands: strands
-            })
-         }
-      }
-      
-      // Deduplicate by permitNumber
-      const unique = []
-      const seen = new Set()
-      for (const p of loosePermits) {
-        if (!seen.has(p.permitNumber)) {
-          seen.add(p.permitNumber)
-          unique.push(p)
-        }
-      }
-      return unique
+      permits.push({
+          permitNumber: pNum,
+          schoolYear: sYear,
+          levels: [...new Set(levels)],
+          strands: levels.includes('Senior High School') ? detectStrands(context) : []
+      })
   }
-  
-  return permits
+
+  // Strategy 3: Loose "No. X-Y s. Z" if strictly prefixed (K-, E-, SHS-, JHS-)
+  // Only if we haven't found much or to supplement
+  const looseRegex = /(?:No\.?|Number)\s*(K-\d+|E-\d+|JHS-\d+|SHS-\d+|S-\d+)\s*s\.?\s*(\d{4})/gi
+  while ((match = looseRegex.exec(t)) !== null) {
+      const pNum = match[1].trim()
+      const sYear = match[2].trim()
+      
+      // Check if this permit is already found
+      if (permits.some(p => p.permitNumber === pNum)) continue;
+
+      const levels = []
+      if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
+      else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
+      else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School') 
+      else if (/^SHS[-]/i.test(pNum)) levels.push('Senior High School')
+
+      permits.push({
+          permitNumber: pNum,
+          schoolYear: sYear,
+          levels: levels,
+          strands: levels.includes('Senior High School') ? detectStrands(t) : []
+      })
+  }
+
+  // Deduplicate permits by number + year
+  const uniquePermits = []
+  const seen = new Set()
+  permits.forEach(p => {
+      const key = `${p.permitNumber}-${p.schoolYear}`
+      if (!seen.has(key)) {
+          seen.add(key)
+          uniquePermits.push(p)
+      }
+  })
+
+  return uniquePermits
 }
 
 async function onPermitFileChange(e) {
@@ -1226,30 +1194,35 @@ function getStatus(schoolYear) {
   
   if (daysPast <= 0) {
     return { label: 'Operating', color: 'green' }
-  } else {
-    // As per user request: "It said to be closed it should be for renewal since the government permit renews yearly."
-    // Any expired permit is "For Renewal" until renewed.
+  } else if (daysPast <= 365) {
+    // Within 1 year of expiration: For Renewal
     return { label: 'For Renewal', color: 'yellow' }
+  } else {
+    // Over 1 year past expiration: Closed
+    return { label: 'Closed', color: 'red' }
   }
 }
 
 function getOverallSchoolStatus(permits) {
   if (!permits || permits.length === 0) return { label: 'No Records', color: 'gray' }
 
-  // Check priorities: Operating > For Renewal
-  const statuses = permits.map(p => getStatus(p.schoolYear))
-  
-  if (statuses.some(s => s.label === 'Operating')) {
-    return { label: 'Operating', color: 'green' }
+  // Helper to get end year for sorting
+  const getEndYear = (sy) => {
+    if (!sy) return 0
+    const parts = sy.split('-').map(p => parseInt(p.trim(), 10))
+    if (parts.length === 2 && !isNaN(parts[1])) return parts[1]
+    const single = parseInt(sy.trim(), 10)
+    return !isNaN(single) ? single + 1 : 0
   }
+
+  // Sort by end year descending to get the latest permit
+  const sorted = [...permits].sort((a, b) => getEndYear(b.schoolYear) - getEndYear(a.schoolYear))
   
-  // If not operating, it's For Renewal (since we removed Closed for expired)
-  return { label: 'For Renewal', color: 'yellow' }
+  // Return status of the latest permit
+  return getStatus(sorted[0].schoolYear)
 }
 
-function getSchoolName(schoolId) {
-  return schools.value.find((s) => s.id === schoolId)?.name ?? 'Unknown'
-}
+
 
 function getSchoolType(schoolId) {
   return schools.value.find((s) => s.id === schoolId)?.type ?? 'Private'
@@ -1277,6 +1250,7 @@ const searchResults = computed(() => {
       grouped[p.schoolId] = {
         schoolId: p.schoolId,
         schoolName: getSchoolName(p.schoolId),
+        schoolAddress: getSchoolAddress(p.schoolId),
         schoolType: getSchoolType(p.schoolId),
         permits: []
       }
@@ -1355,6 +1329,18 @@ const showEmptyState = computed(() => {
           </button>
           <button
             type="button"
+            @click="currentView = 'trash'"
+            class="inline-flex items-center gap-2 text-sm font-medium transition-colors relative"
+            :class="currentView === 'trash' ? 'text-red-600' : 'text-slate-500 hover:text-red-500'"
+          >
+            <div class="relative">
+               <Trash2 :size="18" :class="{ 'animate-bounce text-red-500': trashAnimating }" />
+               <span v-if="trashCount > 0" class="absolute -top-2 -right-2 bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full min-w-[18px] text-center border-2 border-white shadow-sm transition-all duration-300 scale-100" :class="{'scale-125': trashAnimating}">{{ trashCount }}</span>
+            </div>
+            Trash Bin
+          </button>
+          <button
+            type="button"
             @click="currentView = 'registration'"
             class="inline-flex items-center gap-2 text-sm font-medium transition-colors"
             :class="currentView === 'registration' ? 'text-sky-600' : 'text-slate-500 hover:text-slate-700'"
@@ -1404,7 +1390,7 @@ const showEmptyState = computed(() => {
                 <p class="text-2xl font-bold text-slate-800">{{ summaryStats.totalPermits }}</p>
               </div>
            </div>
-           
+
            <!-- Level Breakdown -->
            <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-sm md:col-span-2">
               <div class="flex items-center gap-2 mb-3">
@@ -1472,16 +1458,24 @@ const showEmptyState = computed(() => {
          </div>
 
          <!-- Result cards -->
-         <ul v-else class="space-y-4">
+         <TransitionGroup 
+           name="trash-fly" 
+           tag="ul" 
+           class="space-y-4 relative" 
+           v-else
+         >
             <li
               v-for="group in searchResults"
               :key="group.schoolId"
-              class="group bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden"
+              class="group bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden relative z-10"
             >
               <div class="p-5">
                 <div class="flex flex-col sm:flex-row sm:items-center justify-between mb-4 gap-2">
                   <div class="flex items-center gap-3">
-                    <h3 class="font-semibold text-slate-800 text-lg">{{ group.schoolName }}</h3>
+                    <div>
+                      <h3 class="font-semibold text-slate-800 text-lg">{{ group.schoolName }}</h3>
+                      <p class="text-sm text-slate-500">{{ group.schoolAddress }}</p>
+                    </div>
                     <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                       <button @click="openEditSchool(group.schoolId)" class="p-1.5 text-slate-400 hover:text-sky-600 rounded-lg hover:bg-sky-50 transition-colors" title="Edit School">
                         <Pencil :size="14" />
@@ -1574,8 +1568,89 @@ const showEmptyState = computed(() => {
                 </div>
               </div>
             </li>
-         </ul>
+          </TransitionGroup>
       </div>
+    </main>
+
+    <!-- ─── Trash View ──────────────────────────────────────────────────── -->
+    <main v-else-if="currentView === 'trash'" class="max-w-4xl mx-auto px-4 py-8">
+       <div class="flex items-center gap-3 mb-6">
+          <div class="p-2 bg-red-100 text-red-600 rounded-lg">
+             <Trash2 :size="24" />
+          </div>
+          <div>
+             <h2 class="text-2xl font-bold text-slate-800">Trash Bin</h2>
+             <p class="text-slate-600">Restore deleted items or remove them forever. Items are auto-deleted after 15 days.</p>
+          </div>
+       </div>
+
+       <!-- Trash Tabs -->
+       <div class="flex gap-4 border-b border-slate-200 mb-6">
+          <button 
+             @click="trashTab = 'schools'"
+             class="pb-2 px-1 font-medium text-sm transition-colors border-b-2"
+             :class="trashTab === 'schools' ? 'border-red-500 text-red-600' : 'border-transparent text-slate-500 hover:text-slate-700'"
+          >
+             Deleted Schools ({{ trashSchools.length }})
+          </button>
+          <button 
+             @click="trashTab = 'permits'"
+             class="pb-2 px-1 font-medium text-sm transition-colors border-b-2"
+             :class="trashTab === 'permits' ? 'border-red-500 text-red-600' : 'border-transparent text-slate-500 hover:text-slate-700'"
+          >
+             Deleted Permits ({{ trashPermits.length }})
+          </button>
+       </div>
+
+       <!-- Loading -->
+       <div v-if="trashLoading" class="py-12 text-center text-slate-500">
+          <Loader2 class="w-8 h-8 animate-spin mx-auto mb-2 text-slate-400" />
+          Loading trash...
+       </div>
+
+       <!-- Schools List -->
+       <div v-else-if="trashTab === 'schools'" class="space-y-4">
+          <div v-if="trashSchools.length === 0" class="text-center py-12 bg-slate-50 rounded-xl border border-dashed border-slate-200">
+             <p class="text-slate-500">No deleted schools found.</p>
+          </div>
+          <div v-for="s in trashSchools" :key="s.id" class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between group">
+             <div>
+                <h3 class="font-semibold text-slate-800">{{ s.name }}</h3>
+                <p class="text-sm text-slate-500">{{ s.address }}</p>
+                <p class="text-xs text-slate-400 mt-1">Deleted: {{ new Date(s.deletedAt).toLocaleDateString() }}</p>
+             </div>
+             <div class="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button @click="restoreItem('school', s.id)" class="p-2 text-emerald-600 hover:bg-emerald-50 rounded-lg flex items-center gap-1 text-sm font-medium transition-colors">
+                   <RotateCcw :size="16" /> Restore
+                </button>
+                <button @click="deleteForever('school', s.id)" class="p-2 text-red-600 hover:bg-red-50 rounded-lg flex items-center gap-1 text-sm font-medium transition-colors">
+                   <Trash2 :size="16" /> Delete Forever
+                </button>
+             </div>
+          </div>
+       </div>
+
+       <!-- Permits List -->
+       <div v-else class="space-y-4">
+          <div v-if="trashPermits.length === 0" class="text-center py-12 bg-slate-50 rounded-xl border border-dashed border-slate-200">
+             <p class="text-slate-500">No deleted permits found.</p>
+          </div>
+          <div v-for="p in trashPermits" :key="p.id" class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between group">
+             <div>
+                <h3 class="font-semibold text-slate-800">{{ getSchoolName(p.schoolId) }}</h3>
+                <p class="text-sm text-slate-600">Permit No: {{ p.permitNumber }} (SY {{ p.schoolYear }})</p>
+                <p class="text-xs text-slate-400 mt-1">Deleted: {{ new Date(p.deletedAt).toLocaleDateString() }}</p>
+             </div>
+             <div class="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button @click="restoreItem('permit', p.id)" class="p-2 text-emerald-600 hover:bg-emerald-50 rounded-lg flex items-center gap-1 text-sm font-medium transition-colors">
+                   <RotateCcw :size="16" /> Restore
+                </button>
+                <button @click="deleteForever('permit', p.id)" class="p-2 text-red-600 hover:bg-red-50 rounded-lg flex items-center gap-1 text-sm font-medium transition-colors">
+                   <Trash2 :size="16" /> Delete Forever
+                </button>
+             </div>
+          </div>
+       </div>
     </main>
 
     <!-- ─── Registration View ───────────────────────────────────────────── -->
@@ -1907,10 +1982,7 @@ const showEmptyState = computed(() => {
                 <input type="radio" v-model="editSchoolForm.type" value="Private" class="text-sky-600 focus:ring-sky-500" />
                 <span class="text-sm text-slate-700">Private</span>
               </label>
-              <label class="flex items-center gap-2 cursor-pointer">
-                <input type="radio" v-model="editSchoolForm.type" value="Public" class="text-sky-600 focus:ring-sky-500" />
-                <span class="text-sm text-slate-700">Public</span>
-              </label>
+
               <label class="flex items-center gap-2 cursor-pointer">
                 <input type="radio" v-model="editSchoolForm.type" value="Homeschooling" class="text-sky-600 focus:ring-sky-500" />
                 <span class="text-sm text-slate-700">Homeschooling</span>
