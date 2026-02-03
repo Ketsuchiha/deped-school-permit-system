@@ -87,6 +87,22 @@ function initDb() {
         });
       });
     });
+
+    // Migration: Add Geo columns to schools
+    const geoColumns = [
+      { name: 'latitude', type: 'REAL' },
+      { name: 'longitude', type: 'REAL' },
+      { name: 'geo_accuracy', type: 'TEXT' },
+      { name: 'geo_status', type: 'TEXT' }
+    ];
+    
+    geoColumns.forEach(col => {
+      db.run(`ALTER TABLE schools ADD COLUMN ${col.name} ${col.type}`, (err) => {
+        if (err && !err.message.includes('duplicate column name')) {
+           // console.log(`Error adding ${col.name}:`, err.message);
+        }
+      });
+    });
   });
 }
 
@@ -101,12 +117,34 @@ app.get('/api/schools', (req, res) => {
 });
 
 // Create a school
-app.post('/api/schools', (req, res) => {
+app.post('/api/schools', async (req, res) => {
   const { id, name, type, address } = req.body;
-  const sql = `INSERT INTO schools (id, name, type, address, deleted) VALUES (?, ?, ?, ?, 0)`;
-  db.run(sql, [id, name, type, address], function(err) {
+  
+  let lat = null, lng = null, acc = null, status = 'PENDING';
+
+  try {
+    const GeoService = require('./services/geoService');
+    const geoService = new GeoService();
+    const geoResult = await geoService.resolveLocation(name, address);
+
+    if (geoResult.status === 'SUCCESS') {
+      lat = geoResult.latitude;
+      lng = geoResult.longitude;
+      acc = geoResult.accuracy;
+      status = 'VERIFIED';
+    } else {
+      status = geoResult.status;
+    }
+  } catch (e) {
+    console.error("GeoService Error:", e);
+    status = 'SYSTEM_ERROR';
+  }
+
+  const sql = `INSERT INTO schools (id, name, type, address, latitude, longitude, geo_accuracy, geo_status, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`;
+
+  db.run(sql, [id, name, type, address, lat, lng, acc, status], function(err) {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ id, name, type, address, deleted: 0 });
+    res.json({ id, name, type, address, latitude: lat, longitude: lng, geo_accuracy: acc, geo_status: status, deleted: 0 });
   });
 });
 
@@ -238,6 +276,66 @@ app.delete('/api/permits/:id', (req, res) => {
   db.run(`UPDATE permits SET deleted = 1, deletedAt = ? WHERE id = ?`, [now, id], function(err) {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ message: 'Permit moved to trash' });
+  });
+});
+
+// Geocode an address
+app.get('/api/geocode', async (req, res) => {
+  const { address, name } = req.query;
+  
+  if (!address) {
+    return res.status(400).json({ error: 'Address is required' });
+  }
+
+  try {
+    const GeoService = require('./services/geoService');
+    const geoService = new GeoService();
+    const result = await geoService.resolveLocation(name || '', address);
+    res.json(result);
+  } catch (error) {
+    console.error('Geocoding error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Tile Proxy to bypass client-side blocking
+// Renamed to 'maps/proxy' to avoid 'tile' keyword blocking
+app.get('/api/maps/proxy/:z/:x/:y', (req, res) => {
+  const { z, x, y } = req.params;
+  const https = require('https');
+  const tileUrl = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+  
+  console.log(`[Proxy] Fetching: ${z}/${x}/${y}`);
+
+  const options = {
+    headers: {
+      'User-Agent': 'DepEdPermitSystem/1.0 (Education Project)',
+      'Accept': 'image/png,image/*;q=0.8',
+    }
+  };
+  
+  const proxyReq = https.get(tileUrl, options, (proxyRes) => {
+    if (proxyRes.statusCode !== 200) {
+      console.error(`[Proxy] Upstream Error: ${proxyRes.statusCode}`);
+      proxyRes.resume();
+      return res.status(proxyRes.statusCode).send('Upstream error');
+    }
+    
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    proxyRes.pipe(res);
+  });
+  
+  proxyReq.on('error', (err) => {
+    console.error(`[Proxy] Network Error:`, err.message);
+    if (!res.headersSent) res.status(502).send('Proxy network error');
+  });
+  
+  proxyReq.setTimeout(15000, () => {
+    console.error(`[Proxy] Timeout: ${z}/${x}/${y}`);
+    proxyReq.destroy();
   });
 });
 
