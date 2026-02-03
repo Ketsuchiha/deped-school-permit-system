@@ -1,10 +1,24 @@
 <script setup>
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2, RotateCcw } from 'lucide-vue-next'
 import Tesseract from 'tesseract.js'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import CustomSelect from './components/CustomSelect.vue'
+import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
+
+// Fix for Leaflet marker icons in Vue/Vite environment
+import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
+import markerIcon from 'leaflet/dist/images/marker-icon.png'
+import markerShadow from 'leaflet/dist/images/marker-shadow.png'
+
+delete L.Icon.Default.prototype._getIconUrl
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: markerIcon2x,
+  iconUrl: markerIcon,
+  shadowUrl: markerShadow,
+})
 
 GlobalWorkerOptions.workerSrc = workerSrc
 
@@ -197,6 +211,145 @@ function toggleEditPermitLevel(value) {
   else editPermitForm.value.levels.push(value)
 }
 
+// ─── Create New School ──────────────────────────────────────────────────────
+const schoolForm = ref({
+  name: '',
+  type: 'Private', // Default to Private
+  address: '',
+  fileName: '',
+  file: null, // For OCR upload
+  filePreviewUrl: null,
+  ocrLoading: false,
+  // Combined Flow Fields
+  levels: [],
+  schoolYear: '',
+  permitNumber: '',
+  strands: [],
+  extractedText: '',
+  permits: [{ permitNumber: '', schoolYear: '', levels: [], strands: [] }]
+})
+const schoolFormErrors = ref({})
+
+// Strict Address Input Validation
+function sanitizeAddressInput(e) {
+  const input = e.target.value
+  // Allow only alphanumeric (A-Z, a-z, 0-9), space, period, and comma
+  const sanitized = input.replace(/[^a-zA-Z0-9\s.,]/g, '')
+  
+  // Update if changed
+  if (input !== sanitized) {
+    schoolForm.value.address = sanitized
+    // Force DOM update to reflect sanitized value immediately
+    e.target.value = sanitized
+  }
+}
+
+// ─── Leaflet Map Logic ────────────────────────────────────────────────────────
+const mapContainer = ref(null)
+const mapInstance = ref(null)
+const mapMarker = ref(null)
+const isGeocoding = ref(false)
+const geocodeError = ref('')
+let debounceTimer = null
+
+function initMap() {
+  if (!mapContainer.value || mapInstance.value) return
+  
+  // Default: Calamba/Cabuyao area (approximate center) or Philippines
+  // Cabuyao Coordinates: 14.277, 121.123
+  mapInstance.value = L.map(mapContainer.value).setView([14.277, 121.123], 13)
+  
+  // Use local proxy to bypass client-side blocking of OSM tiles
+  // Endpoint changed to /maps/proxy to avoid ad-blocker keywords
+  const tiles = L.tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  })
+  
+  tiles.on('tileerror', (error) => {
+    console.warn('Map tile failed to load:', error)
+  })
+  
+  tiles.addTo(mapInstance.value)
+}
+
+async function updateMapFromAddress() {
+  const address = schoolForm.value.address
+  if (!address || address.length < 5) return
+
+  isGeocoding.value = true
+  geocodeError.value = ''
+
+  try {
+    const res = await fetch(`${API_URL}/geocode?address=${encodeURIComponent(address)}&name=${encodeURIComponent(schoolForm.value.name)}`)
+    const data = await res.json()
+
+    if (data.status === 'SUCCESS' && data.latitude && data.longitude) {
+      const lat = parseFloat(data.latitude)
+      const lng = parseFloat(data.longitude)
+      
+      if (mapMarker.value) {
+          mapMarker.value.setLatLng([lat, lng])
+      } else {
+          mapMarker.value = L.marker([lat, lng]).addTo(mapInstance.value)
+      }
+      
+      mapInstance.value.setView([lat, lng], 16)
+    } else {
+      // Don't remove marker immediately if user is just typing, but maybe warn?
+      // Actually requirement says: "If geocoding fails, do not place a marker; Display a clear error"
+      geocodeError.value = 'Address not found on map'
+      if (mapMarker.value) {
+        mapInstance.value.removeLayer(mapMarker.value)
+        mapMarker.value = null
+      }
+    }
+  } catch (e) {
+    console.error('Map update error:', e)
+    geocodeError.value = 'Failed to load map data'
+  } finally {
+    isGeocoding.value = false
+  }
+}
+
+// Watch address change with debounce
+watch(() => schoolForm.value.address, (newVal) => {
+  if (!newVal) return
+  if (debounceTimer) clearTimeout(debounceTimer)
+  debounceTimer = setTimeout(() => {
+    updateMapFromAddress()
+  }, 1000)
+})
+
+// Watch view change to init map when Registration tab opens
+watch(currentView, async (newVal) => {
+  if (newVal === 'registration') {
+    // Reset map instance if it exists but container is new (should rely on cleanup, but just in case)
+    if (mapInstance.value) {
+       mapInstance.value.remove()
+       mapInstance.value = null
+       mapMarker.value = null
+    }
+
+    await nextTick()
+    // Give a slight delay for transition/rendering
+    setTimeout(() => {
+       initMap()
+       // If address is already pre-filled (e.g. from OCR), update map
+       if (schoolForm.value.address) {
+          updateMapFromAddress()
+       }
+    }, 300)
+  } else {
+    // Cleanup map when leaving registration view
+    if (mapInstance.value) {
+       mapInstance.value.remove()
+       mapInstance.value = null
+       mapMarker.value = null
+    }
+  }
+})
+
 onMounted(async () => {
   await refreshData()
 })
@@ -306,39 +459,6 @@ async function deleteForever(type, id) {
     }
   } catch (err) {
     showToast('Failed to delete item', 'error')
-  }
-}
-
-// ─── Create New School ──────────────────────────────────────────────────────
-const schoolForm = ref({
-  name: '',
-  type: 'Private', // Default to Private
-  address: '',
-  fileName: '',
-  file: null, // For OCR upload
-  filePreviewUrl: null,
-  ocrLoading: false,
-  // Combined Flow Fields
-  levels: [],
-  schoolYear: '',
-  permitNumber: '',
-  strands: [],
-  extractedText: '',
-  permits: [{ permitNumber: '', schoolYear: '', levels: [], strands: [] }]
-})
-const schoolFormErrors = ref({})
-
-// Strict Address Input Validation
-function sanitizeAddressInput(e) {
-  const input = e.target.value
-  // Allow only alphanumeric (A-Z, a-z, 0-9), space, period, and comma
-  const sanitized = input.replace(/[^a-zA-Z0-9\s.,]/g, '')
-  
-  // Update if changed
-  if (input !== sanitized) {
-    schoolForm.value.address = sanitized
-    // Force DOM update to reflect sanitized value immediately
-    e.target.value = sanitized
   }
 }
 
@@ -1787,6 +1907,19 @@ const showEmptyState = computed(() => {
               placeholder="e.g., 123 Main Street, City, Province"
               class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none"
             />
+            
+            <!-- Map Section -->
+            <div class="mt-2 mb-4">
+               <div ref="mapContainer" class="w-full h-64 rounded-lg border border-slate-300 z-0 bg-slate-50"></div>
+               <div v-if="isGeocoding" class="flex items-center gap-2 text-xs text-slate-500 mt-1">
+                  <Loader2 class="w-3 h-3 animate-spin" />
+                  Locating address on map...
+               </div>
+               <div v-if="geocodeError" class="text-xs text-red-500 mt-1 flex items-center gap-1">
+                  <XCircle class="w-3 h-3" />
+                  {{ geocodeError }}
+               </div>
+            </div>
           </div>
 
           <!-- Permit Details (Loop for Multiple Permits) -->

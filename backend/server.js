@@ -279,6 +279,66 @@ app.delete('/api/permits/:id', (req, res) => {
   });
 });
 
+// Geocode an address
+app.get('/api/geocode', async (req, res) => {
+  const { address, name } = req.query;
+  
+  if (!address) {
+    return res.status(400).json({ error: 'Address is required' });
+  }
+
+  try {
+    const GeoService = require('./services/geoService');
+    const geoService = new GeoService();
+    const result = await geoService.resolveLocation(name || '', address);
+    res.json(result);
+  } catch (error) {
+    console.error('Geocoding error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Tile Proxy to bypass client-side blocking
+// Renamed to 'maps/proxy' to avoid 'tile' keyword blocking
+app.get('/api/maps/proxy/:z/:x/:y', (req, res) => {
+  const { z, x, y } = req.params;
+  const https = require('https');
+  const tileUrl = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+  
+  console.log(`[Proxy] Fetching: ${z}/${x}/${y}`);
+
+  const options = {
+    headers: {
+      'User-Agent': 'DepEdPermitSystem/1.0 (Education Project)',
+      'Accept': 'image/png,image/*;q=0.8',
+    }
+  };
+  
+  const proxyReq = https.get(tileUrl, options, (proxyRes) => {
+    if (proxyRes.statusCode !== 200) {
+      console.error(`[Proxy] Upstream Error: ${proxyRes.statusCode}`);
+      proxyRes.resume();
+      return res.status(proxyRes.statusCode).send('Upstream error');
+    }
+    
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    proxyRes.pipe(res);
+  });
+  
+  proxyReq.on('error', (err) => {
+    console.error(`[Proxy] Network Error:`, err.message);
+    if (!res.headersSent) res.status(502).send('Proxy network error');
+  });
+  
+  proxyReq.setTimeout(15000, () => {
+    console.error(`[Proxy] Timeout: ${z}/${x}/${y}`);
+    proxyReq.destroy();
+  });
+});
+
 // ─── Trash Endpoints ─────────────────────────────────────────────
 
 // Get all trash items
