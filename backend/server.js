@@ -87,6 +87,22 @@ function initDb() {
         });
       });
     });
+
+    // Migration: Add Geo columns to schools
+    const geoColumns = [
+      { name: 'latitude', type: 'REAL' },
+      { name: 'longitude', type: 'REAL' },
+      { name: 'geo_accuracy', type: 'TEXT' },
+      { name: 'geo_status', type: 'TEXT' }
+    ];
+    
+    geoColumns.forEach(col => {
+      db.run(`ALTER TABLE schools ADD COLUMN ${col.name} ${col.type}`, (err) => {
+        if (err && !err.message.includes('duplicate column name')) {
+           // console.log(`Error adding ${col.name}:`, err.message);
+        }
+      });
+    });
   });
 }
 
@@ -101,12 +117,34 @@ app.get('/api/schools', (req, res) => {
 });
 
 // Create a school
-app.post('/api/schools', (req, res) => {
+app.post('/api/schools', async (req, res) => {
   const { id, name, type, address } = req.body;
-  const sql = `INSERT INTO schools (id, name, type, address, deleted) VALUES (?, ?, ?, ?, 0)`;
-  db.run(sql, [id, name, type, address], function(err) {
+  
+  let lat = null, lng = null, acc = null, status = 'PENDING';
+
+  try {
+    const GeoService = require('./services/geoService');
+    const geoService = new GeoService();
+    const geoResult = await geoService.resolveLocation(name, address);
+
+    if (geoResult.status === 'SUCCESS') {
+      lat = geoResult.latitude;
+      lng = geoResult.longitude;
+      acc = geoResult.accuracy;
+      status = 'VERIFIED';
+    } else {
+      status = geoResult.status;
+    }
+  } catch (e) {
+    console.error("GeoService Error:", e);
+    status = 'SYSTEM_ERROR';
+  }
+
+  const sql = `INSERT INTO schools (id, name, type, address, latitude, longitude, geo_accuracy, geo_status, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`;
+
+  db.run(sql, [id, name, type, address, lat, lng, acc, status], function(err) {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ id, name, type, address, deleted: 0 });
+    res.json({ id, name, type, address, latitude: lat, longitude: lng, geo_accuracy: acc, geo_status: status, deleted: 0 });
   });
 });
 

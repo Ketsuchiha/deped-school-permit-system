@@ -324,9 +324,24 @@ const schoolForm = ref({
   permitNumber: '',
   strands: [],
   extractedText: '',
-  detectedPermits: [] // Array of { permitNumber, schoolYear, levels, strands }
+  permits: [{ permitNumber: '', schoolYear: '', levels: [], strands: [] }]
 })
 const schoolFormErrors = ref({})
+
+// Strict Address Input Validation
+function sanitizeAddressInput(e) {
+  const input = e.target.value
+  // Allow only alphanumeric (A-Z, a-z, 0-9), space, period, and comma
+  const sanitized = input.replace(/[^a-zA-Z0-9\s.,]/g, '')
+  
+  // Update if changed
+  if (input !== sanitized) {
+    schoolForm.value.address = sanitized
+    // Force DOM update to reflect sanitized value immediately
+    e.target.value = sanitized
+  }
+}
+
 const createTab = ref('school') // 'school' | 'homeschool'
 
 async function onSchoolFileChange(e) {
@@ -496,9 +511,13 @@ async function onSchoolFileChange(e) {
     // Strategy 3: Scan for City/Province
     if (!foundAddress) {
       const addressBlockList = /^(Department|Republic|Region|Division|Office|District|Subject|To:|From:|The)/i
+      // Explicitly ignore DepEd Regional Office Header Address
+      const depEdHeaderRegex = /Karangalan\s+Village|Cainta,? \s*Rizal|Region\s+IV-A/i
+
       for (const line of lines) {
         if (line.includes(foundName)) continue
         if (addressBlockList.test(line)) continue
+        if (depEdHeaderRegex.test(line)) continue // Skip DepEd Header Address
         
         const hasCity = /\bCity\b/.test(line) && !/City\s+Schools\s+Division/i.test(line)
         const hasProvince = /\bProvince\b/.test(line) && !/Province\s+of/i.test(line)
@@ -529,7 +548,7 @@ async function onSchoolFileChange(e) {
 
     // ─── Unified Flow: Extract Multiple Permits ───
     const extractedPermits = extractPermitDetails(text)
-    if (extractedPermits.length > 0) {
+    if (extractedPermits && extractedPermits.length > 0) {
       schoolForm.value.permits = extractedPermits.map(p => ({
          permitNumber: p.permitNumber,
          schoolYear: p.schoolYear,
@@ -554,8 +573,10 @@ async function onSchoolFileChange(e) {
     }
 
   } catch (err) {
-    console.error(err)
-    showToast('Failed to scan file', 'error')
+    console.error('File Processing Error:', err)
+    let msg = 'Failed to scan file'
+    if (err.message) msg += `: ${err.message}`
+    showToast(msg, 'error')
   } finally {
     schoolForm.value.ocrLoading = false
   }
@@ -759,9 +780,10 @@ function showToast(message, type = 'success') {
 
 /** Extract multiple permit details from OCR text */
 function extractPermitDetails(text) {
-  if (!text || !text.trim()) return []
+  if (!text || typeof text !== 'string' || !text.trim()) return []
   
   const t = text.replace(/\s+/g, ' ').trim()
+  console.log('Extracted Text for Permit Detection:', t)
   const permits = []
 
   // Helper: Detect Strands (Full names & Abbreviations)
@@ -785,9 +807,9 @@ function extractPermitDetails(text) {
   }
   
   // Strategy 1: Standard Government Permit Pattern
-  // Matches: "Government Permit (Region IV-A) No. K-123 s. 2024", "GP No. 123 s. 2023", "Authority to Operate No..."
-  // Added "Authority to Operate" and "DepEd Permit"
-  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s+\(Region\s+[IVX\d\w-]+\))?\s+(?:No\.?|Number)\s*([A-Z0-9\s-]+)\s*(?:s\.?|series\s+of)\s*(\d{4})/gi
+  // Matches: "Government Permit (R - IVA) No. SHS-089, s. 2018"
+  // Generalized to handle optional parenthesized text (like Region) and commas
+  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4})/gi
   
   let match
   while ((match = gpRegex.exec(t)) !== null) {
@@ -795,7 +817,7 @@ function extractPermitDetails(text) {
     const sYear = match[2].trim()
     
     // Stop if pNum becomes too long (likely captured garbage text due to \s)
-    if (pNum.length > 20) continue
+    if (pNum.length > 25) continue
     
     const levels = []
     let strands = []
@@ -808,7 +830,8 @@ function extractPermitDetails(text) {
     
     // Context fallback (look around the match)
     if (levels.length === 0) {
-       const context = t.substring(Math.max(0, match.index - 300), match.index + 300)
+       // Increased context window to 1000 chars to catch "Senior High School" if it's far away
+       const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
        if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
        if (/Elementary/i.test(context)) levels.push('Elementary')
        if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
@@ -816,7 +839,8 @@ function extractPermitDetails(text) {
     }
 
     if (levels.includes('Senior High School')) {
-       strands = detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 500))
+       // Search strands in a larger context (forward 2000 chars)
+       strands = detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000))
     }
 
     permits.push({
@@ -828,15 +852,15 @@ function extractPermitDetails(text) {
   }
 
   // Strategy 2: Government Recognition Pattern
-  // "GOVERNMENT RECOGNITION No. 001 s. 2020" or just "GOVERNMENT RECOGNITION ... for ... Course"
-  const grRegex = /Government\s+Recognition\s+(?:No\.?|Number)?\s*([A-Z0-9\s-]+)?\s*(?:s\.?|series\s+of)\s*(\d{4})/gi
+  // Added support for (Region ...) and relaxed "No." matching
+  const grRegex = /Government\s+Recognition(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)?[\s,.]*(?:s\.?|series\s+of)\s*(\d{4})/gi
   while ((match = grRegex.exec(t)) !== null) {
       const pNum = match[1] ? match[1].trim() : 'Gov. Rec.'
-      if (pNum.length > 20) continue
+      if (pNum.length > 25) continue
       const sYear = match[2]
       
       const levels = []
-      const context = t.substring(Math.max(0, match.index - 300), match.index + 300)
+      const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
       
       if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
       if (/Elementary/i.test(context)) levels.push('Elementary')
@@ -847,31 +871,45 @@ function extractPermitDetails(text) {
           permitNumber: pNum,
           schoolYear: sYear,
           levels: [...new Set(levels)],
-          strands: levels.includes('Senior High School') ? detectStrands(context) : []
+          strands: levels.includes('Senior High School') ? detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000)) : []
       })
   }
 
-  // Strategy 3: Loose "No. X-Y s. Z" if strictly prefixed (K-, E-, SHS-, JHS-, S-)
-  // Only if we haven't found much or to supplement
-  const looseRegex = /(?:No\.?|Number)\s*(K-\s*\d+|E-\s*\d+|JHS-\s*\d+|SHS-\s*\d+|S-\s*\d+)\s*(?:s\.?|series\s+of)\s*(\d{4})/gi
+  // Strategy 3: Loose "No. X-Y s. Z" (Relaxed)
+  // Matches "No. 001 s. 2024", "No. K-123 s. 2024", "No. 123-A s. 2024"
+  // Must have "No." or "Number" to avoid false positives in random text
+  // Updated to allow comma before s.
+  const looseRegex = /(?:No\.?|Number)[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4})/gi
   while ((match = looseRegex.exec(t)) !== null) {
       const pNum = match[1].replace(/\s+/g, '').trim()
       const sYear = match[2].trim()
+      
+      // Validation: Length check (avoid "No. I s. 2024" if 'I' is just a pronoun or garbage)
+      if (pNum.length < 2 || pNum.length > 25) continue
       
       // Check if this permit is already found
       if (permits.some(p => p.permitNumber === pNum)) continue;
 
       const levels = []
+      // Check prefix or surrounding context
       if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
       else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
       else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School') 
       else if (/^SHS[-]/i.test(pNum)) levels.push('Senior High School')
+      
+      if (levels.length === 0) {
+          const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
+          if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
+          if (/Elementary/i.test(context)) levels.push('Elementary')
+          if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
+          if (/Senior\s*High/i.test(context)) levels.push('Senior High School')
+      }
 
       permits.push({
           permitNumber: pNum,
           schoolYear: sYear,
           levels: levels,
-          strands: levels.includes('Senior High School') ? detectStrands(t) : []
+          strands: levels.includes('Senior High School') ? detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000)) : []
       })
   }
 
@@ -1744,6 +1782,7 @@ const showEmptyState = computed(() => {
             <input
               id="schoolAddress"
               v-model="schoolForm.address"
+              @input="sanitizeAddressInput"
               type="text"
               placeholder="e.g., 123 Main Street, City, Province"
               class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none"

@@ -9,6 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@vue-leaflet/vue-leaflet": "^0.10.1",
+    "leaflet": "^1.9.4",
     "lucide-vue-next": "^0.460.0",
     "pdfjs-dist": "^5.4.530",
     "tesseract.js": "^5.1.0",
