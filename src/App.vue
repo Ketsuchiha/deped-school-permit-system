@@ -256,10 +256,16 @@ const schoolForm = ref({
 const schoolFormErrors = ref({})
 
 // Strict Address Input Validation
+function sanitizeAddressString(input) {
+  if (!input) return ''
+  // Allow only letters (A-Z, a-z) and space
+  // No numbers or special characters allowed
+  return input.replace(/[^a-zA-Z\s]/g, '')
+}
+
 function sanitizeAddressInput(e) {
   const input = e.target.value
-  // Allow only alphanumeric (A-Z, a-z, 0-9), space, period, and comma
-  const sanitized = input.replace(/[^a-zA-Z0-9\s.,]/g, '')
+  const sanitized = sanitizeAddressString(input)
   
   // Update if changed
   if (input !== sanitized) {
@@ -732,7 +738,7 @@ async function onSchoolFileChange(e) {
     let foundAddress = ''
     
     // Strategy 1: "located at [Address]" (Strongest)
-    const locatedMatch = cleanTextForName.match(/located\s+at\s+([A-Z0-9\s.,&'-]+?)(?:\s+(?:approving|approves|granting|granted|hereby|which|where|to\s+operate|subject\s+to|pursuant|under|following|\(School\))|$)/i)
+    const locatedMatch = cleanTextForName.match(/located\s+at\s+([A-Z0-9\s.,&'-]+?)(?:\s+(?:approving|approves|granting|granted|hereby|which|where|to\s+operate|subject\s+to|pursuant|under|following|through|is\s+hereby|\(School\))|$)/i)
     if (locatedMatch && locatedMatch[1]) {
        foundAddress = locatedMatch[1].trim().replace(/[.,;:]+$/, '')
     }
@@ -771,6 +777,15 @@ async function onSchoolFileChange(e) {
         if (hasCity || hasProvince || hasStreet) {
            let cleaned = line.replace(/^(located at|address[:.]?)\s*/i, '')
            cleaned = cleaned.replace(/[.,;:]+$/, '')
+           // Stop at common delimiters to avoid grabbing subsequent sentence parts
+           const stopWords = [' through ', ' subject to ', ' pursuant ', ' under ', ' following ', ' is hereby ']
+           for (const word of stopWords) {
+             const idx = cleaned.toLowerCase().indexOf(word)
+             if (idx !== -1) {
+               cleaned = cleaned.substring(0, idx)
+               break
+             }
+           }
            if (cleaned.split(' ').length > 2) {
               foundAddress = cleaned
               break
@@ -780,7 +795,10 @@ async function onSchoolFileChange(e) {
     }
     
     if (foundName) schoolForm.value.name = foundName
-    if (foundAddress) schoolForm.value.address = foundAddress
+    if (foundAddress) {
+       // Apply strict sanitization to OCR address result
+       schoolForm.value.address = sanitizeAddressString(foundAddress)
+    }
 
     // Fallback: Use Filename as School Name if still empty and filename looks like a name
     if (!schoolForm.value.name && file.name) {
@@ -1052,9 +1070,9 @@ function extractPermitDetails(text) {
   }
   
   // Strategy 1: Standard Government Permit Pattern
-  // Matches: "Government Permit (R - IVA) No. SHS-089, s. 2018"
+  // Matches: "Government Permit (R - IVA) No. SHS-089, s. 2018" or "dated 2018"
   // Generalized to handle optional parenthesized text (like Region) and commas
-  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4})/gi
+  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of|dated)\s*(\d{4}(?:[-]\d{4})?)/gi
   
   let match
   while ((match = gpRegex.exec(t)) !== null) {
@@ -1062,7 +1080,7 @@ function extractPermitDetails(text) {
     const sYear = match[2].trim()
     
     // Stop if pNum becomes too long (likely captured garbage text due to \s)
-    if (pNum.length > 25) continue
+    if (pNum.length > 35) continue // Increased limit slightly
     
     const levels = []
     let strands = []
@@ -1098,10 +1116,10 @@ function extractPermitDetails(text) {
 
   // Strategy 2: Government Recognition Pattern
   // Added support for (Region ...) and relaxed "No." matching
-  const grRegex = /Government\s+Recognition(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)?[\s,.]*(?:s\.?|series\s+of)\s*(\d{4})/gi
+  const grRegex = /Government\s+Recognition(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)?[\s,.]*(?:s\.?|series\s+of|dated)\s*(\d{4}(?:[-]\d{4})?)/gi
   while ((match = grRegex.exec(t)) !== null) {
       const pNum = match[1] ? match[1].trim() : 'Gov. Rec.'
-      if (pNum.length > 25) continue
+      if (pNum.length > 35) continue
       const sYear = match[2]
       
       const levels = []
@@ -1124,13 +1142,13 @@ function extractPermitDetails(text) {
   // Matches "No. 001 s. 2024", "No. K-123 s. 2024", "No. 123-A s. 2024"
   // Must have "No." or "Number" to avoid false positives in random text
   // Updated to allow comma before s.
-  const looseRegex = /(?:No\.?|Number)[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4})/gi
+  const looseRegex = /(?:No\.?|Number)[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of|dated)\s*(\d{4}(?:[-]\d{4})?)/gi
   while ((match = looseRegex.exec(t)) !== null) {
       const pNum = match[1].replace(/\s+/g, '').trim()
       const sYear = match[2].trim()
       
       // Validation: Length check (avoid "No. I s. 2024" if 'I' is just a pronoun or garbage)
-      if (pNum.length < 2 || pNum.length > 25) continue
+      if (pNum.length < 2 || pNum.length > 35) continue
       
       // Check if this permit is already found
       if (permits.some(p => p.permitNumber === pNum)) continue;
@@ -2166,7 +2184,7 @@ const showEmptyState = computed(() => {
               v-model="schoolForm.address"
               @input="sanitizeAddressInput"
               type="text"
-              placeholder="e.g., 123 Main Street, City, Province"
+              placeholder="e.g. Main Street City Province"
               class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none"
             />
             
