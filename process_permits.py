@@ -5,12 +5,8 @@ import json
 import pdfplumber # type: ignore
 import pytesseract
 from pdf2image import convert_from_path
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance
 
-# NOTE: You must have Tesseract-OCR installed on your system.
-# Windows: https://github.com/UB-Mannheim/tesseract/wiki
-# Set the path if it's not in your PATH environment variable:
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 class SchoolPermitProcessor:
     def __init__(self, file_path):
@@ -60,9 +56,19 @@ class SchoolPermitProcessor:
     def _process_image(self):
         try:
             image = Image.open(self.file_path)
+            # Preprocess
+            image = self._preprocess_image(image)
             self.text = pytesseract.image_to_string(image)
         except Exception as e:
             print(f"Image OCR Error: {e}")
+
+    def _preprocess_image(self, image):
+        # Convert to grayscale
+        image = ImageOps.grayscale(image)
+        # Increase contrast
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(2.0)
+        return image
 
     def _process_pdf(self):
         try:
@@ -82,7 +88,9 @@ class SchoolPermitProcessor:
                             # Convert page to image
                             images = convert_from_path(self.file_path, first_page=i+1, last_page=i+1)
                             if images:
-                                text = pytesseract.image_to_string(images[0])
+                                # Preprocess
+                                processed_img = self._preprocess_image(images[0])
+                                text = pytesseract.image_to_string(processed_img)
                         except Exception as e:
                             print(f"Page {i+1} OCR failed: {e}")
                     
@@ -122,20 +130,23 @@ class SchoolPermitProcessor:
         # --- School Name ---
         found_name = ""
         
-        # Strategy 1: "To [Name]" Pattern
-        to_match = re.search(r'(?:^|\n)(?:To|Issued\s+to|Granted\s+to)[:\s]*\n*([A-Z0-9\s.,&\'-]+?)(?:\n+\(School\)|\s+located\s+at|\s+to\s+operate|\s+for\s+the|\n|$)', self.text, re.IGNORECASE)
+        # Strategy 1: "To [Name]" Pattern with stricter checks
+        # Matches "To: SCHOOL NAME" or "Issued to: SCHOOL NAME"
+        to_match = re.search(r'(?:^|\n)(?:To|Issued\s+to|Granted\s+to|Name\s+of\s+School)[:\s]*\n*([A-Z0-9\s.,&\'-]+?)(?:\n+\(School\)|\s+located\s+at|\s+to\s+operate|\s+for\s+the|\n|$)', self.text, re.IGNORECASE)
         if to_match:
             candidate = to_match.group(1).strip()
-            if 'Regional Director' not in candidate and len(candidate) > 3:
-                found_name = candidate
+            # Ignore if it looks like a person's name or title unless it has school keywords
+            if 'Regional Director' not in candidate and 'Superintendent' not in candidate:
+                if len(candidate) > 3:
+                    found_name = candidate
 
         # Strategy 2: "The [Name] located at" Pattern
         if not found_name:
-            the_match = re.search(r'The\s+([A-Z0-9\s.,&\'-]+?)\s+located\s+at', self.text, re.IGNORECASE)
+            the_match = re.search(r'(?:The|That)\s+([A-Z0-9\s.,&\'-]+?)\s+located\s+at', self.text, re.IGNORECASE)
             if the_match:
                 found_name = the_match.group(1).strip()
 
-        # Strategy 3: Explicit Labels "(School)"
+        # Strategy 3: Explicit Labels "(School)" or "School Name:"
         if not found_name:
             for i, line in enumerate(lines):
                 if re.search(r'\(School\)', line, re.IGNORECASE) or re.search(r'\(Name of School\)', line, re.IGNORECASE):
@@ -144,8 +155,8 @@ class SchoolPermitProcessor:
                         if prev_line and not re.match(r'^To$', prev_line, re.IGNORECASE) and len(prev_line) > 3:
                             found_name = prev_line
                             break
-
-        # Fallback: Keywords
+        
+        # Fallback: Keywords in all caps lines
         if not found_name:
             school_keywords = ['School', 'Academy', 'College', 'Institute', 'University', 'Montessori', 'Learning Center', 'Lyceum']
             ignored_prefixes = r'^(Respectfully|This\s+permit|Pursuant|Republic|Department|Region|Division|Office|Subject|To:|From:)'
@@ -154,6 +165,7 @@ class SchoolPermitProcessor:
                 if re.match(ignored_prefixes, line, re.IGNORECASE): continue
                 if len(line) > 80 or '...' in line: continue
                 
+                # Check if line has school keyword and is significant
                 if any(k in line for k in school_keywords):
                     found_name = line
                     break
@@ -171,13 +183,19 @@ class SchoolPermitProcessor:
         # --- Address ---
         found_address = ""
         
-        # Strategy 1: "located at"
-        located_match = re.search(r'located\s+at\s+([A-Z0-9\s.,&\'-]+?)(?:\s+(?:approving|approves|granting|granted|hereby|which|where|to\s+operate|subject\s+to|pursuant|under|following|\(School\))|$)', self.text, re.IGNORECASE)
+        # Strategy 1: "located at" or "situated at"
+        located_match = re.search(r'(?:located|situated)\s+at\s+([A-Z0-9\s.,&\'-]+?)(?:\s+(?:approving|approves|granting|granted|hereby|which|where|to\s+operate|subject\s+to|pursuant|under|following|\(School\))|$)', self.text, re.IGNORECASE)
         if located_match:
             found_address = located_match.group(1).strip()
             found_address = re.sub(r'[.,;:]+$', '', found_address)
 
-        # Strategy 2: Explicit Labels
+        # Strategy 2: Explicit Labels "Address:"
+        if not found_address:
+             addr_match = re.search(r'(?:Address|Location)[:\s]*\s+([A-Z0-9\s.,&\'-]+?)(?:\n|$)', self.text, re.IGNORECASE)
+             if addr_match:
+                 found_address = addr_match.group(1).strip()
+
+        # Strategy 3: Lines below (Address)
         if not found_address:
             for i, line in enumerate(lines):
                 if re.search(r'\(Complete Address\)', line, re.IGNORECASE) or re.search(r'\(Address\)', line, re.IGNORECASE):
@@ -203,7 +221,7 @@ class SchoolPermitProcessor:
         gp_pattern = r'(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s+\(Region\s+[IVX\d\w-]+\))?\s+(?:No\.?|Number)\s*([A-Z0-9\s-]+)\s*(?:s\.?|series\s+of)\s*(\d{4})'
         
         for match in re.finditer(gp_pattern, text, re.IGNORECASE):
-            p_num = match.group(1).strip()
+            p_num = match.group(1).replace(" ", "").strip()
             s_year = match.group(2).strip()
             
             if len(p_num) > 20: continue # Garbage check
@@ -213,7 +231,7 @@ class SchoolPermitProcessor:
         # --- Strategy 2: Government Recognition Pattern ---
         gr_pattern = r'Government\s+Recognition\s+(?:No\.?|Number)?\s*([A-Z0-9\s-]+)?\s*(?:s\.?|series\s+of)\s*(\d{4})'
         for match in re.finditer(gr_pattern, text, re.IGNORECASE):
-            p_num = match.group(1).strip() if match.group(1) else 'Gov. Rec.'
+            p_num = match.group(1).replace(" ", "").strip() if match.group(1) else 'Gov. Rec.'
             s_year = match.group(2).strip()
             
             if len(p_num) > 20: continue
@@ -252,6 +270,11 @@ class SchoolPermitProcessor:
             if re.search(r'Elementary', context, re.IGNORECASE): levels.append('Elementary')
             if re.search(r'Junior\s*High', context, re.IGNORECASE): levels.append('Junior High School')
             if re.search(r'Senior\s*High', context, re.IGNORECASE): levels.append('Senior High School')
+            
+            # Specific Grades Check
+            if re.search(r'Grades?\s+1', context, re.IGNORECASE): levels.append('Elementary')
+            if re.search(r'Grades?\s+7', context, re.IGNORECASE): levels.append('Junior High School')
+            if re.search(r'Grades?\s+11', context, re.IGNORECASE): levels.append('Senior High School')
         
         levels = list(set(levels))
 

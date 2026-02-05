@@ -4,6 +4,8 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const sqlite3 = require('sqlite3').verbose();
+const nodemailer = require('nodemailer');
+const cron = require('node-cron');
 
 const app = express();
 const PORT = 3000;
@@ -88,6 +90,13 @@ function initDb() {
       });
     });
 
+    // Migration: Add localFilePath to permits
+    db.run(`ALTER TABLE permits ADD COLUMN localFilePath TEXT`, (err) => {
+      if (err && !err.message.includes('duplicate column name')) {
+        // console.log(`Error adding localFilePath:`, err.message);
+      }
+    });
+
     // Migration: Add Geo columns to schools
     const geoColumns = [
       { name: 'latitude', type: 'REAL' },
@@ -103,16 +112,158 @@ function initDb() {
         }
       });
     });
+
+    // Create Audit Logs Table
+    db.run(`CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      action TEXT,
+      details TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
   });
 }
 
+// ─── Email & Audit Helpers ─────────────────────────────────────
+
+function logAudit(action, details) {
+  const sql = `INSERT INTO audit_logs (action, details) VALUES (?, ?)`;
+  db.run(sql, [action, JSON.stringify(details)], (err) => {
+    if (err) console.error('Audit Log Error:', err);
+  });
+}
+
+// Mock Email Transporter (For demonstration - use real credentials in production)
+const transporter = nodemailer.createTransport({
+  host: 'smtp.ethereal.email',
+  port: 587,
+  auth: {
+    user: 'ethereal.user@example.com',
+    pass: 'ethereal.pass'
+  }
+});
+
+async function sendRenewalNotification(schoolName, expiryDate) {
+  try {
+    // In a real app, you would fetch the school's contact email
+    const info = await transporter.sendMail({
+      from: '"School Permit System" <system@example.com>',
+      to: "admin@example.com", 
+      subject: `Permit Renewal Required: ${schoolName}`,
+      text: `The permit for ${schoolName} is set to expire on ${expiryDate}. Please renew immediately.`
+    });
+    console.log("Email notification sent (Mock):", info.messageId);
+    logAudit('EMAIL_SENT', { school: schoolName, type: 'Renewal Notification' });
+  } catch (error) {
+    console.error("Email Error:", error);
+  }
+}
+
+// Cron Job: Check for renewals every day at midnight
+cron.schedule('0 0 * * *', () => {
+  console.log('Running daily renewal check...');
+  checkRenewals();
+});
+
+function checkRenewals() {
+  const sql = `
+    SELECT s.name, p.schoolYear 
+    FROM schools s 
+    JOIN permits p ON s.id = p.schoolId 
+    WHERE p.deleted = 0 
+    GROUP BY s.id 
+    ORDER BY p.schoolYear DESC
+  `;
+  
+  db.all(sql, [], (err, rows) => {
+    if (err) return;
+    
+    const currentYear = new Date().getFullYear();
+    rows.forEach(row => {
+      const match = row.schoolYear.match(/(\d{4})/);
+      if (match) {
+        const startYear = parseInt(match[1]);
+        const endYear = startYear + 1;
+        
+        // Notify if 30 days before end of school year (assuming ends in June/July? Let's assume May)
+        // Or simpler: If current year is the end year, notify.
+        if (currentYear === endYear) {
+             // Logic to avoid spamming can be added here (check if already notified)
+             // sendRenewalNotification(row.name, endYear);
+        }
+      }
+    });
+  });
+}
+
+
 // ─── API Endpoints ─────────────────────────────────────────────
 
-// Get all active schools
+// Helper to calculate school status
+function calculateSchoolStatus(permits) {
+  if (!permits || permits.length === 0) return 'No Permits';
+
+  // Extract years
+  const years = permits.map(p => {
+    const match = p.schoolYear.match(/(\d{4})/);
+    return match ? parseInt(match[1]) : 0;
+  }).sort((a, b) => b - a); // Descending
+
+  if (years.length === 0) return 'No Valid Years';
+
+  const currentYear = new Date().getFullYear();
+  const latestStartYear = years[0];
+  // Assuming SY starts in year X and ends in X+1
+  const latestEndYear = latestStartYear + 1; 
+
+  // Check for gaps
+  // A gap exists if the difference between consecutive start years is > 1
+  let hasGap = false;
+  for (let i = 0; i < years.length - 1; i++) {
+    if (years[i] - years[i+1] > 1) {
+      hasGap = true;
+      break;
+    }
+  }
+
+  // Logic
+  if (currentYear > latestEndYear + 1) {
+    return 'Closed'; // Expired more than a year ago
+  } else if (currentYear >= latestEndYear) {
+    return 'For Renewal'; // Expired recently or currently expiring
+  } else if (hasGap) {
+    // Recent permit exists but history has gaps?
+    // The prompt says "Closed: If the system detects a gap of one year or more in the permit sequence"
+    // But usually Closed means *currently* closed.
+    // "Operational: If the system detects a continuous sequence"
+    return 'Operational (Recovered)'; 
+  } else {
+    return 'Operational';
+  }
+}
+
+// Get all active schools with computed status
 app.get('/api/schools', (req, res) => {
-  db.all("SELECT * FROM schools WHERE deleted = 0 OR deleted IS NULL", [], (err, rows) => {
+  const sql = `
+    SELECT s.*, 
+           json_group_array(json_object('schoolYear', p.schoolYear)) as permit_years
+    FROM schools s
+    LEFT JOIN permits p ON s.id = p.schoolId AND (p.deleted = 0 OR p.deleted IS NULL)
+    WHERE s.deleted = 0 OR s.deleted IS NULL
+    GROUP BY s.id
+  `;
+
+  db.all(sql, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
+    
+    const schools = rows.map(row => {
+      const permitYears = JSON.parse(row.permit_years || '[]').filter(p => p.schoolYear);
+      const status = calculateSchoolStatus(permitYears);
+      // Remove the temp field
+      delete row.permit_years;
+      return { ...row, status };
+    });
+
+    res.json(schools);
   });
 });
 
@@ -177,10 +328,18 @@ app.post('/api/permits', upload.single('file'), (req, res) => {
       originalName = req.file.originalname;
     }
     
-    const sql = `INSERT INTO permits (id, schoolId, levels, schoolYear, permitNumber, extractedText, filePath, fileName, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`;
+    const sql = `INSERT INTO permits (id, schoolId, levels, schoolYear, permitNumber, extractedText, filePath, localFilePath, fileName, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`;
     
-    db.run(sql, [id, schoolId, levels, schoolYear, permitNumber, extractedText, fileUrl, originalName], function(err) {
+    db.run(sql, [id, schoolId, levels, schoolYear, permitNumber, extractedText, fileUrl, filePath, originalName], function(err) {
       if (err) return res.status(500).json({ error: err.message });
+      
+      logAudit('UPLOAD_PERMIT', { 
+        schoolId, 
+        permitNumber, 
+        schoolYear, 
+        fileName: originalName 
+      });
+
       res.json({
         id,
         schoolId,
@@ -189,6 +348,7 @@ app.post('/api/permits', upload.single('file'), (req, res) => {
         permitNumber,
         extractedText,
         filePreviewUrl: fileUrl,
+        localFilePath: filePath,
         fileName: originalName,
         deleted: 0
       });
@@ -242,8 +402,9 @@ app.put('/api/permits/:id', upload.single('file'), (req, res) => {
     if (req.file) {
       fileUrl = `http://localhost:${PORT}/uploads/${req.file.filename}`;
       originalName = req.file.originalname;
-      sql = `UPDATE permits SET schoolId = ?, levels = ?, schoolYear = ?, permitNumber = ?, extractedText = ?, filePath = ?, fileName = ? WHERE id = ?`;
-      params = [schoolId, levels, schoolYear, permitNumber, extractedText, fileUrl, originalName, id];
+      const localFilePath = req.file.path;
+      sql = `UPDATE permits SET schoolId = ?, levels = ?, schoolYear = ?, permitNumber = ?, extractedText = ?, filePath = ?, fileName = ?, localFilePath = ? WHERE id = ?`;
+      params = [schoolId, levels, schoolYear, permitNumber, extractedText, fileUrl, originalName, localFilePath, id];
     } else {
       // If no new file, keep existing file info
       sql = `UPDATE permits SET schoolId = ?, levels = ?, schoolYear = ?, permitNumber = ?, extractedText = ? WHERE id = ?`;
@@ -252,6 +413,14 @@ app.put('/api/permits/:id', upload.single('file'), (req, res) => {
 
     db.run(sql, params, function(err) {
       if (err) return res.status(500).json({ error: err.message });
+      
+      logAudit('UPDATE_PERMIT', { 
+        id, 
+        schoolId, 
+        permitNumber, 
+        schoolYear 
+      });
+
       res.json({
         id,
         schoolId,

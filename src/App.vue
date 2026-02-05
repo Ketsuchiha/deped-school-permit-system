@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue'
-import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2, RotateCcw } from 'lucide-vue-next'
+import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2, RotateCcw, Eye, Download } from 'lucide-vue-next'
 import Tesseract from 'tesseract.js'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
@@ -90,6 +90,9 @@ async function deleteSchool(schoolId) {
     const res = await fetch(`${API_URL}/schools/${schoolId}`, { method: 'DELETE' })
     if (res.ok) {
       showToast('School deleted successfully', 'success')
+      if (selectedSchool.value?.schoolId === schoolId) {
+        selectedSchool.value = null
+      }
       refreshData()
       triggerTrashAnim()
     } else {
@@ -1245,6 +1248,14 @@ function getStatus(schoolYear) {
   }
 }
 
+function getStatusBadgeClass(status) {
+  if (!status) return 'bg-gray-50 text-gray-600 border-gray-200'
+  if (status.includes('Operational')) return 'bg-green-50 text-green-700 border-green-200'
+  if (status === 'For Renewal') return 'bg-yellow-50 text-yellow-700 border-yellow-200'
+  if (status === 'Closed') return 'bg-red-50 text-red-700 border-red-200'
+  return 'bg-gray-50 text-gray-600 border-gray-200'
+}
+
 function getOverallSchoolStatus(permits) {
   if (!permits || permits.length === 0) return { label: 'No Records', color: 'gray' }
 
@@ -1278,6 +1289,37 @@ function closePreview() {
   previewPermit.value = null
 }
 
+const selectedSchool = ref(null)
+const isRenewingPermit = ref(false)
+
+function viewSchoolDetails(schoolId) {
+  const group = searchResults.value.find(g => g.schoolId === schoolId)
+  if (group) {
+    selectedSchool.value = group
+  }
+}
+
+function openRenewPermit(schoolId) {
+  resetPermitForm()
+  permitForm.value.schoolId = schoolId
+  isRenewingPermit.value = true
+}
+
+function downloadFile(permit) {
+  const url = permit.filePreviewUrl || `${API_URL.replace('/api', '')}/uploads/${permit.fileName}`
+  const link = document.createElement('a')
+  link.href = url
+  link.target = '_blank'
+  link.download = permit.fileName || `permit-${permit.permitNumber || 'doc'}`
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+}
+
+function closeSchoolDetails() {
+  selectedSchool.value = null
+}
+
 // ─── Public Search: filtered results ────────────────────────────────────────
 const filterType = ref('All') // 'All' | 'Private' | 'Homeschooling'
 
@@ -1289,11 +1331,13 @@ const searchResults = computed(() => {
   const grouped = {}
   permits.value.forEach(p => {
     if (!grouped[p.schoolId]) {
+      const s = schools.value.find(sc => sc.id === p.schoolId)
       grouped[p.schoolId] = {
         schoolId: p.schoolId,
-        schoolName: getSchoolName(p.schoolId),
-        schoolAddress: getSchoolAddress(p.schoolId),
-        schoolType: getSchoolType(p.schoolId),
+        schoolName: s ? s.name : 'Unknown',
+        schoolAddress: s ? s.address : '',
+        schoolType: s ? s.type : 'Private',
+        status: s ? s.status : 'No Permits',
         permits: []
       }
     }
@@ -1301,6 +1345,23 @@ const searchResults = computed(() => {
   })
   
   let results = Object.values(grouped)
+  
+  // Handle Duplicate Names (Branch Detection)
+  const nameCounts = {}
+  results.forEach(r => {
+    const n = r.schoolName.trim().toLowerCase()
+    nameCounts[n] = (nameCounts[n] || 0) + 1
+  })
+
+  results.forEach(r => {
+    if (nameCounts[r.schoolName.trim().toLowerCase()] > 1) {
+       r.isDuplicateName = true
+       // Try to extract a meaningful location identifier
+       const addr = r.schoolAddress || ''
+       const match = addr.match(/([a-zA-Z0-9\s]+)(?:City|Province|St\.|Ave)/i)
+       r.branchIdentifier = match ? match[1].trim() : addr.substring(0, 20) + '...'
+    }
+  })
   
   // Filter by query (school name)
   if (q) {
@@ -1509,13 +1570,24 @@ const showEmptyState = computed(() => {
             <li
               v-for="group in searchResults"
               :key="group.schoolId"
-              class="group bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden relative z-10"
+              class="group bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden relative z-10 cursor-pointer hover:border-sky-300 transition-colors"
+              @click="viewSchoolDetails(group.schoolId)"
             >
               <div class="p-5">
                 <div class="flex flex-col sm:flex-row sm:items-center justify-between mb-4 gap-2">
                   <div class="flex items-center gap-3">
                     <div>
-                      <h3 class="font-semibold text-slate-800 text-lg">{{ group.schoolName }}</h3>
+                      <div class="flex items-center gap-2 mb-1">
+                        <h3 class="font-semibold text-slate-800 text-lg">
+                          {{ group.schoolName }}
+                          <span v-if="group.isDuplicateName" class="text-xs font-normal text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded ml-2">
+                            {{ group.branchIdentifier }}
+                          </span>
+                        </h3>
+                        <span :class="getStatusBadgeClass(group.status)" class="text-xs font-medium px-2 py-0.5 rounded-full border">
+                          {{ group.status }}
+                        </span>
+                      </div>
                       <p class="text-sm text-slate-500">{{ group.schoolAddress }}</p>
                     </div>
                     <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -2044,6 +2116,126 @@ const showEmptyState = computed(() => {
       </div>
     </div>
 
+    <!-- School Details Modal -->
+    <div v-if="selectedSchool" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div class="bg-white rounded-xl shadow-xl w-full max-w-2xl overflow-hidden animate-in zoom-in-95 duration-200 flex flex-col max-h-[90vh]">
+        <!-- Header -->
+        <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+          <div>
+            <h3 class="font-bold text-slate-800 text-lg">{{ selectedSchool.schoolName }}</h3>
+            <div class="flex items-center gap-2 mt-1">
+              <span :class="getStatusBadgeClass(selectedSchool.status)" class="text-xs font-medium px-2 py-0.5 rounded-full border">
+                {{ selectedSchool.status }}
+              </span>
+              <span class="text-sm text-slate-500">• {{ selectedSchool.schoolType }}</span>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <button 
+              @click="openEditSchool(selectedSchool.schoolId)"
+              class="text-xs font-medium text-slate-600 hover:text-sky-600 flex items-center gap-1 bg-white border border-slate-200 hover:border-sky-300 px-3 py-1.5 rounded-lg transition-colors shadow-sm"
+            >
+              <Pencil :size="14" />
+              Edit Info
+            </button>
+            <button 
+              @click="deleteSchool(selectedSchool.schoolId)"
+              class="text-xs font-medium text-red-600 hover:text-red-700 flex items-center gap-1 bg-white border border-slate-200 hover:border-red-300 px-3 py-1.5 rounded-lg transition-colors shadow-sm"
+            >
+              <Trash2 :size="14" />
+              Delete
+            </button>
+            <div class="w-px h-6 bg-slate-200 mx-1"></div>
+            <button @click="closeSchoolDetails" class="text-slate-400 hover:text-slate-600 transition-colors">
+              <XCircle :size="24" />
+            </button>
+          </div>
+        </div>
+
+        <!-- Body -->
+        <div class="p-6 overflow-y-auto flex-1">
+          <!-- Address -->
+          <div class="mb-6 flex items-start gap-3">
+            <MapPin class="w-5 h-5 text-slate-400 mt-0.5" />
+            <div>
+              <p class="text-sm font-medium text-slate-700">Address</p>
+              <p class="text-slate-600">{{ selectedSchool.schoolAddress || 'No address provided' }}</p>
+            </div>
+          </div>
+
+          <!-- Permit History -->
+          <div class="mb-6">
+            <div class="flex items-center justify-between mb-4">
+              <h4 class="font-semibold text-slate-800 flex items-center gap-2">
+                <History class="w-4 h-4 text-sky-600" />
+                Permit History
+              </h4>
+              <button 
+                @click="openRenewPermit(selectedSchool.schoolId)" 
+                class="text-sm font-medium text-sky-600 hover:text-sky-700 flex items-center gap-1 hover:bg-sky-50 px-2 py-1 rounded-lg transition-colors"
+              >
+                <Plus :size="16" />
+                Renew / Add Permit
+              </button>
+            </div>
+
+            <div v-if="selectedSchool.permits.length === 0" class="text-center py-8 bg-slate-50 rounded-xl border border-dashed border-slate-200">
+              <p class="text-slate-500">No permits found.</p>
+            </div>
+
+            <div v-else class="space-y-3">
+              <div 
+                v-for="permit in selectedSchool.permits.sort((a,b) => (b.schoolYear || '').localeCompare(a.schoolYear || ''))" 
+                :key="permit.id" 
+                class="bg-white border border-slate-200 rounded-lg p-4 hover:border-sky-300 transition-colors group"
+              >
+                <div class="flex items-start justify-between">
+                  <div>
+                    <div class="flex items-center gap-2 mb-1">
+                      <span class="font-bold text-slate-800">{{ permit.schoolYear }}</span>
+                      <span :class="getStatusBadgeClass(getStatus(permit.schoolYear).label)" class="text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider">
+                        {{ getStatus(permit.schoolYear).label }}
+                      </span>
+                    </div>
+                    <p class="text-sm text-slate-600 mb-1">Permit No: <span class="font-medium">{{ permit.permitNumber }}</span></p>
+                    <div class="flex flex-wrap gap-1">
+                      <span v-for="lvl in permit.levels" :key="lvl" class="text-xs bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">
+                        {{ lvl }}
+                      </span>
+                    </div>
+                  </div>
+                  
+                  <div class="flex flex-col gap-2">
+                     <button 
+                       @click="openPreview(permit)" 
+                       class="text-xs font-medium text-sky-600 hover:text-sky-700 flex items-center gap-1 bg-sky-50 hover:bg-sky-100 px-2 py-1.5 rounded transition-colors"
+                     >
+                       <Eye :size="14" />
+                       View File
+                     </button>
+                     <button 
+                       @click="downloadFile(permit)" 
+                       class="text-xs font-medium text-emerald-600 hover:text-emerald-700 flex items-center gap-1 bg-emerald-50 hover:bg-emerald-100 px-2 py-1.5 rounded transition-colors"
+                     >
+                       <Download :size="14" />
+                       Download
+                     </button>
+                     <button 
+                       @click="openEditPermit(permit)" 
+                       class="text-xs font-medium text-slate-500 hover:text-sky-600 flex items-center gap-1 hover:bg-slate-50 px-2 py-1.5 rounded transition-colors"
+                     >
+                       <Pencil :size="14" />
+                       Edit
+                     </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Edit Permit Modal -->
     <div v-if="isEditingPermit" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
       <div class="bg-white rounded-xl shadow-xl w-full max-w-lg overflow-hidden animate-in zoom-in-95 duration-200">
@@ -2091,6 +2283,123 @@ const showEmptyState = computed(() => {
         <div class="px-6 py-4 bg-slate-50 flex justify-end gap-3">
           <button @click="isEditingPermit = false" class="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800">Cancel</button>
           <button @click="saveEditPermit" class="px-4 py-2 text-sm font-medium text-white bg-sky-600 rounded-lg hover:bg-sky-700">Save Changes</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Renew Permit Modal -->
+    <div v-if="isRenewingPermit" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div class="bg-white rounded-xl shadow-xl w-full max-w-lg overflow-hidden animate-in zoom-in-95 duration-200 flex flex-col max-h-[90vh]">
+        <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center">
+          <h3 class="font-bold text-slate-800 flex items-center gap-2">
+            <Upload class="text-sky-600" :size="20" />
+            Renew / Add Permit
+          </h3>
+          <button @click="isRenewingPermit = false" class="text-slate-400 hover:text-slate-600">
+            <XCircle :size="20" />
+          </button>
+        </div>
+        
+        <div class="p-6 space-y-4 overflow-y-auto">
+          <!-- File Upload -->
+          <div 
+            class="border-2 border-dashed border-slate-300 rounded-xl p-6 text-center hover:border-sky-400 hover:bg-sky-50 transition-colors cursor-pointer relative"
+            :class="{'border-sky-500 bg-sky-50': permitForm.file}"
+          >
+            <input 
+              type="file" 
+              accept=".pdf,image/*" 
+              class="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+              @change="onPermitFileChange"
+            />
+            <div v-if="ocrLoading" class="flex flex-col items-center justify-center py-4">
+              <Loader2 class="animate-spin text-sky-600 mb-2" :size="32" />
+              <p class="text-sm font-medium text-slate-600">Scanning document...</p>
+            </div>
+            <div v-else-if="permitForm.file" class="flex flex-col items-center">
+              <FileImage class="text-sky-600 mb-2" :size="32" />
+              <p class="text-sm font-medium text-slate-800">{{ permitForm.fileName }}</p>
+              <p class="text-xs text-emerald-600 mt-1">Ready to upload</p>
+            </div>
+            <div v-else class="flex flex-col items-center">
+              <Upload class="text-slate-400 mb-2" :size="32" />
+              <p class="text-sm font-medium text-slate-600">Click to upload Permit</p>
+              <p class="text-xs text-slate-400 mt-1">PDF or Image supported</p>
+            </div>
+          </div>
+
+          <!-- Fields -->
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">Permit Number <span class="text-red-500">*</span></label>
+              <input 
+                v-model="permitForm.permitNumber" 
+                type="text" 
+                class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none transition-all"
+                :class="{'border-red-300 focus:ring-red-200': permitFormErrors.permitNumber, 'animate-shimmer bg-gradient-to-r from-transparent via-white/50 to-transparent bg-[length:200%_100%]': ocrLoading}" 
+                placeholder="e.g. SHS-012"
+              />
+              <p v-if="permitFormErrors.permitNumber" class="text-xs text-red-500 mt-1">{{ permitFormErrors.permitNumber }}</p>
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">School Year <span class="text-red-500">*</span></label>
+              <input 
+                v-model="permitForm.schoolYear" 
+                type="text" 
+                class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none transition-all"
+                :class="{'border-red-300 focus:ring-red-200': permitFormErrors.schoolYear}" 
+                placeholder="YYYY-YYYY"
+              />
+              <p v-if="permitFormErrors.schoolYear" class="text-xs text-red-500 mt-1">{{ permitFormErrors.schoolYear }}</p>
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-slate-700 mb-2">Levels Covered <span class="text-red-500">*</span></label>
+            <div class="grid grid-cols-2 gap-2">
+              <label 
+                v-for="opt in levelOptions" 
+                :key="opt.value" 
+                class="flex items-center gap-2 p-2 rounded border cursor-pointer hover:bg-slate-50 transition-colors"
+                :class="permitForm.levels.includes(opt.value) ? 'border-sky-500 bg-sky-50' : 'border-slate-200'"
+              >
+                <input 
+                  type="checkbox" 
+                  :value="opt.value" 
+                  class="rounded text-sky-600 focus:ring-sky-500"
+                  :checked="permitForm.levels.includes(opt.value)"
+                  @change="toggleLevel(opt.value)"
+                >
+                <span class="text-sm text-slate-700">{{ opt.label }}</span>
+              </label>
+            </div>
+            <p v-if="permitFormErrors.levels" class="text-xs text-red-500 mt-1">{{ permitFormErrors.levels }}</p>
+          </div>
+
+          <!-- SHS Strands -->
+          <div v-if="permitForm.levels.includes('Senior High School')" class="animate-in slide-in-from-top-2 duration-300">
+             <label class="block text-sm font-medium text-slate-700 mb-1">SHS Strands Detected</label>
+             <div class="flex flex-wrap gap-2 p-3 bg-slate-50 rounded-lg border border-slate-200 min-h-[50px]">
+                <span v-if="permitForm.strands.length === 0" class="text-sm text-slate-400 italic">No specific strands detected/selected</span>
+                <span v-for="(strand, idx) in permitForm.strands" :key="idx" class="bg-white border border-slate-200 text-slate-700 text-xs px-2 py-1 rounded shadow-sm flex items-center gap-1">
+                   {{ strand }}
+                   <button @click="permitForm.strands.splice(idx, 1)" class="text-slate-400 hover:text-red-500"><XCircle :size="12"/></button>
+                </span>
+                <button class="text-xs text-sky-600 hover:underline px-2" @click="() => { const s = prompt('Add Strand (e.g. STEM):'); if(s) permitForm.strands.push(s) }">+ Add</button>
+             </div>
+          </div>
+        </div>
+
+        <div class="px-6 py-4 bg-slate-50 flex justify-end gap-3">
+          <button @click="isRenewingPermit = false" class="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800">Cancel</button>
+          <button 
+            @click="async () => { const success = await submitPermit(); if(success) isRenewingPermit = false; }" 
+            class="px-4 py-2 text-sm font-medium text-white bg-sky-600 rounded-lg hover:bg-sky-700 shadow-sm flex items-center gap-2"
+            :disabled="ocrLoading"
+          >
+            <Loader2 v-if="ocrLoading" class="animate-spin" :size="16" />
+            Upload Permit
+          </button>
         </div>
       </div>
     </div>
