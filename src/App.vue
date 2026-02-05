@@ -1110,8 +1110,26 @@ function showToast(message, type = 'success') {
 function extractPermitDetails(text) {
   if (!text || typeof text !== 'string' || !text.trim()) return []
   
-  const t = text.replace(/\s+/g, ' ').trim()
-  console.log('Extracted Text for Permit Detection:', t)
+  // 1. Pre-process: Normalize whitespace and fix common OCR typos in keywords
+  let t = text.replace(/\s+/g, ' ').trim()
+  
+  // Fuzzy replacements for key terms
+  const replacements = [
+    { pattern: /G[o0]vern?ment\s+P[e3]rmit/gi, replacement: 'Government Permit' },
+    { pattern: /G[o0]vern?ment\s+Rec[o0]gni[t7]ion/gi, replacement: 'Government Recognition' },
+    { pattern: /DepEd\s+P[e3]rmit/gi, 'replacement': 'Government Permit' },
+    { pattern: /Auth[o0]rity\s+to\s+Operate/gi, replacement: 'Authority to Operate' },
+    { pattern: /Provi[s5]ional\s+P[e3]rmit/gi, replacement: 'Provisional Permit' },
+    { pattern: /s\.\s*(\d{4})/gi, replacement: 's. $1' }, // Ensure space after s.
+    { pattern: /series\s+of/gi, replacement: 's.' },
+    { pattern: /dated/gi, replacement: 's.' } // Treat "dated" as "s." for parsing
+  ]
+  
+  replacements.forEach(({ pattern, replacement }) => {
+    t = t.replace(pattern, replacement)
+  })
+  
+  console.log('Extracted Text (Normalized):', t)
   const permits = []
 
   // Helper: Detect Strands (Full names & Abbreviations)
@@ -1139,7 +1157,6 @@ function extractPermitDetails(text) {
     }
     
     // TVL & Specializations
-    // Common TVL Specializations to trigger "TVL" checkbox
     const tvlKeywords = [
        'TVL', 
        'Technical[- ]Vocational[- ]Livelihood',
@@ -1167,32 +1184,47 @@ function extractPermitDetails(text) {
     return found
   }
   
-  // Strategy 1: Standard Government Permit Pattern
-  // Matches: "Government Permit (R - IVA) No. SHS-089, s. 2018" or "dated 2018"
-  // Generalized to handle optional parenthesized text (like Region) and commas
-  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of|dated)\s*(\d{4}(?:[-]\d{4})?)/gi
+  // Helper: Clean Permit Number
+  const cleanPermitNumber = (raw) => {
+      // Remove trailing punctuation
+      let clean = raw.replace(/[.,:;]+$/, '').trim()
+      // Fix common char swaps in numbers (O -> 0, l/I -> 1) if mixed
+      // Only apply if it looks like it should be alphanumeric (e.g., "SHS-O89" -> "SHS-089")
+      if (/[A-Z]+-\w+/.test(clean)) {
+          const parts = clean.split('-')
+          if (parts.length > 1) {
+              // Usually the second part is numeric
+              parts[1] = parts[1].replace(/O/g, '0').replace(/[lI]/g, '1')
+              clean = parts.join('-')
+          }
+      }
+      return clean
+  }
+
+  // Strategy 1: Strong "Keyword ... No. ... s. Year" Pattern
+  // Matches: "Government Permit (R-IVA) No. SHS-089 s. 2018"
+  const strongRegex = /(?:Government\s+Permit|Government\s+Recognition|Authority\s+to\s+Operate|Provisional\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+?)[\s,.]+(?:s\.)\s*(\d{4}(?:[-]\d{4})?)/gi
   
   let match
-  while ((match = gpRegex.exec(t)) !== null) {
-    const pNum = match[1].trim()
-    const sYear = match[2].trim()
+  while ((match = strongRegex.exec(t)) !== null) {
+    let pNum = cleanPermitNumber(match[1])
+    let sYear = match[2].trim()
     
-    // Stop if pNum becomes too long (likely captured garbage text due to \s)
-    if (pNum.length > 35) continue // Increased limit slightly
+    // Validation: Permit number shouldn't be too long or contain too many spaces
+    if (pNum.length > 30 || (pNum.match(/\s/g) || []).length > 3) continue
     
     const levels = []
     let strands = []
     
     // Infer Level from Permit Number Prefix
-    if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
-    else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
-    else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School') 
-    else if (/^SHS[-]/i.test(pNum)) levels.push('Senior High School')
+    if (/^K[-]/i.test(pNum) || /Kindergarten/i.test(pNum)) levels.push('Kindergarten')
+    else if (/^E[-]/i.test(pNum) || /Elementary/i.test(pNum)) levels.push('Elementary')
+    else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum) || /Junior/i.test(pNum)) levels.push('Junior High School') 
+    else if (/^SHS[-]/i.test(pNum) || /Senior/i.test(pNum)) levels.push('Senior High School')
     
-    // Context fallback (look around the match)
+    // Context fallback
     if (levels.length === 0) {
-       // Increased context window to 1000 chars to catch "Senior High School" if it's far away
-       const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
+       const context = t.substring(Math.max(0, match.index - 800), match.index + 800)
        if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
        if (/Elementary/i.test(context)) levels.push('Elementary')
        if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
@@ -1200,66 +1232,42 @@ function extractPermitDetails(text) {
     }
 
     if (levels.includes('Senior High School')) {
-       // Search strands in a larger context (forward 2000 chars)
        strands = detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000))
     }
 
     permits.push({
       permitNumber: pNum,
       schoolYear: sYear,
-      levels: [...new Set(levels)], // Dedupe
+      levels: [...new Set(levels)],
       strands: strands
     })
   }
 
-  // Strategy 2: Government Recognition Pattern
-  // Added support for (Region ...) and relaxed "No." matching
-  const grRegex = /Government\s+Recognition(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)?[\s,.]*(?:s\.?|series\s+of|dated)\s*(\d{4}(?:[-]\d{4})?)/gi
-  while ((match = grRegex.exec(t)) !== null) {
-      const pNum = match[1] ? match[1].trim() : 'Gov. Rec.'
-      if (pNum.length > 35) continue
-      const sYear = match[2]
-      
-      const levels = []
-      const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
-      
-      if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
-      if (/Elementary/i.test(context)) levels.push('Elementary')
-      if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
-      if (/Senior\s*High/i.test(context)) levels.push('Senior High School')
-
-      permits.push({
-          permitNumber: pNum,
-          schoolYear: sYear,
-          levels: [...new Set(levels)],
-          strands: levels.includes('Senior High School') ? detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000)) : []
-      })
-  }
-
-  // Strategy 3: Loose "No. X-Y s. Z" (Relaxed)
-  // Matches "No. 001 s. 2024", "No. K-123 s. 2024", "No. 123-A s. 2024"
-  // Must have "No." or "Number" to avoid false positives in random text
-  // Updated to allow comma before s.
-  const looseRegex = /(?:No\.?|Number)[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of|dated)\s*(\d{4}(?:[-]\d{4})?)/gi
+  // Strategy 2: Relaxed "No. ... s. Year" (fallback)
+  // Only if no strong matches, or to catch additional ones
+  // Must look like a structured ID (e.g., contains dashes or digits) to avoid false positives
+  const looseRegex = /(?:No\.?|Number)[\s:.]*([A-Z0-9-]{3,20})[\s,.]+(?:s\.)\s*(\d{4}(?:[-]\d{4})?)/gi
+  
   while ((match = looseRegex.exec(t)) !== null) {
-      const pNum = match[1].replace(/\s+/g, '').trim()
+      let pNum = cleanPermitNumber(match[1])
       const sYear = match[2].trim()
       
-      // Validation: Length check (avoid "No. I s. 2024" if 'I' is just a pronoun or garbage)
-      if (pNum.length < 2 || pNum.length > 35) continue
-      
-      // Check if this permit is already found
+      // Skip if already found
       if (permits.some(p => p.permitNumber === pNum)) continue;
 
+      // Basic validation for loose match
+      // Must contain at least one digit or a hyphen to be considered a permit number
+      if (!/[\d-]/.test(pNum)) continue;
+
       const levels = []
-      // Check prefix or surrounding context
+      // Check prefix
       if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
       else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
       else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School') 
       else if (/^SHS[-]/i.test(pNum)) levels.push('Senior High School')
       
       if (levels.length === 0) {
-          const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
+          const context = t.substring(Math.max(0, match.index - 800), match.index + 800)
           if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
           if (/Elementary/i.test(context)) levels.push('Elementary')
           if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
@@ -1269,7 +1277,7 @@ function extractPermitDetails(text) {
       permits.push({
           permitNumber: pNum,
           schoolYear: sYear,
-          levels: levels,
+          levels: [...new Set(levels)],
           strands: levels.includes('Senior High School') ? detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000)) : []
       })
   }
@@ -1278,6 +1286,7 @@ function extractPermitDetails(text) {
   const uniquePermits = []
   const seen = new Set()
   permits.forEach(p => {
+      // Normalize year for dedupe (2024 -> 2024-2025? Optional, keeping raw for now)
       const key = `${p.permitNumber}-${p.schoolYear}`
       if (!seen.has(key)) {
           seen.add(key)
