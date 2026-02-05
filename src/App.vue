@@ -1,10 +1,24 @@
 <script setup>
-import { ref, computed, watch, onMounted } from 'vue'
-import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2, RotateCcw, Eye, Download } from 'lucide-vue-next'
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
+import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2, RotateCcw, Eye, Download, MapPin } from 'lucide-vue-next'
 import Tesseract from 'tesseract.js'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import CustomSelect from './components/CustomSelect.vue'
+import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
+
+// Fix for Leaflet marker icons in Vue/Vite environment
+import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
+import markerIcon from 'leaflet/dist/images/marker-icon.png'
+import markerShadow from 'leaflet/dist/images/marker-shadow.png'
+
+delete L.Icon.Default.prototype._getIconUrl
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: markerIcon2x,
+  iconUrl: markerIcon,
+  shadowUrl: markerShadow,
+})
 
 GlobalWorkerOptions.workerSrc = workerSrc
 
@@ -58,6 +72,7 @@ const isEditingSchool = ref(false)
 const isEditingPermit = ref(false)
 const editSchoolForm = ref({})
 const editPermitForm = ref({})
+const editSchoolPermits = ref([])
 
 async function refreshData() {
   try {
@@ -80,6 +95,18 @@ function openEditSchool(schoolId) {
   if (!s) return
   editSchoolForm.value = { ...s }
   isEditingSchool.value = true
+  editSchoolPermits.value = permits.value
+    .filter(p => p.schoolId === schoolId)
+    .map(p => ({
+      id: p.id,
+      schoolId: p.schoolId,
+      levels: Array.isArray(p.levels) ? [...p.levels] : [],
+      schoolYear: p.schoolYear || '',
+      permitNumber: p.permitNumber || '',
+      extractedText: p.extractedText || '',
+      fileName: p.fileName || '',
+      filePreviewUrl: p.filePreviewUrl || ''
+    }))
 }
 
 async function deleteSchool(schoolId) {
@@ -114,7 +141,19 @@ async function saveEditSchool() {
     })
     
     if (res.ok) {
-      showToast('School updated successfully', 'success')
+      for (const p of editSchoolPermits.value) {
+        const formData = new FormData()
+        formData.append('schoolId', p.schoolId)
+        formData.append('levels', JSON.stringify(p.levels))
+        formData.append('schoolYear', p.schoolYear)
+        formData.append('permitNumber', p.permitNumber)
+        formData.append('extractedText', p.extractedText || '')
+        await fetch(`${API_URL}/permits/${p.id}`, {
+          method: 'PUT',
+          body: formData
+        })
+      }
+      showToast('School and permits updated', 'success')
       isEditingSchool.value = false
       refreshData()
     } else {
@@ -200,6 +239,201 @@ function toggleEditPermitLevel(value) {
   else editPermitForm.value.levels.push(value)
 }
 
+// ─── Create New School ──────────────────────────────────────────────────────
+const schoolForm = ref({
+  name: '',
+  type: 'Private', // Default to Private
+  address: '',
+  fileName: '',
+  file: null, // For OCR upload
+  filePreviewUrl: null,
+  ocrLoading: false,
+  // Combined Flow Fields
+  levels: [],
+  schoolYear: '',
+  permitNumber: '',
+  strands: [],
+  extractedText: '',
+  permits: [{ permitNumber: '', schoolYear: '', levels: [], strands: [] }]
+})
+const schoolFormErrors = ref({})
+
+// Strict Address Input Validation
+function sanitizeAddressString(input) {
+  if (!input) return ''
+  // Allow only letters (A-Z, a-z) and space
+  // No numbers or special characters allowed
+  return input.replace(/[^a-zA-Z\s]/g, '')
+}
+
+function sanitizeAddressInput(e) {
+  const input = e.target.value
+  const sanitized = sanitizeAddressString(input)
+  
+  // Update if changed
+  if (input !== sanitized) {
+    schoolForm.value.address = sanitized
+    // Force DOM update to reflect sanitized value immediately
+    e.target.value = sanitized
+  }
+}
+
+// ─── Leaflet Map Logic ────────────────────────────────────────────────────────
+const mapContainer = ref(null)
+const mapInstance = ref(null)
+const mapMarker = ref(null)
+const isGeocoding = ref(false)
+const geocodeError = ref('')
+let debounceTimer = null
+
+function initMap() {
+  if (!mapContainer.value || mapInstance.value) return
+  
+  // Default: Calamba/Cabuyao area (approximate center) or Philippines
+  // Cabuyao Coordinates: 14.277, 121.123
+  mapInstance.value = L.map(mapContainer.value).setView([14.277, 121.123], 13)
+  
+  // Use local proxy to bypass client-side blocking of OSM tiles
+  // Endpoint changed to /maps/proxy to avoid ad-blocker keywords
+  const tiles = L.tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  })
+  
+  tiles.on('tileerror', (error) => {
+    console.warn('Map tile failed to load:', error)
+  })
+  
+  tiles.addTo(mapInstance.value)
+
+  // Manual Pinning with Reverse Geocoding
+  mapInstance.value.on('click', async (e) => {
+     const { lat, lng } = e.latlng
+     await handleManualPin(lat, lng)
+  })
+}
+
+async function handleManualPin(lat, lng) {
+  // 1. Update Marker immediately for responsiveness
+  if (mapMarker.value) {
+      mapMarker.value.setLatLng([lat, lng])
+  } else {
+      mapMarker.value = L.marker([lat, lng], { draggable: true }).addTo(mapInstance.value)
+      
+      // Allow dragging the marker to refine position
+      mapMarker.value.on('dragend', async (event) => {
+        const pos = event.target.getLatLng()
+        await handleManualPin(pos.lat, pos.lng)
+      })
+  }
+  
+  // 2. Update Form Coordinates
+  schoolForm.value.latitude = lat
+  schoolForm.value.longitude = lng
+  
+  // 3. Reverse Geocode (Get Address from Pin)
+  isGeocoding.value = true
+  geocodeError.value = ''
+  
+  try {
+     const res = await fetch(`${API_URL}/reverse-geocode?lat=${lat}&lon=${lng}`)
+     const data = await res.json()
+     
+     if (data.status === 'SUCCESS' && data.address) {
+        // Update the address input
+        schoolForm.value.address = data.address
+     }
+  } catch (e) {
+     console.error('Reverse geocode error:', e)
+     // Don't show error to user as this is an enhancement, not a critical failure
+  } finally {
+     isGeocoding.value = false
+  }
+}
+
+async function updateMapFromAddress() {
+  const address = schoolForm.value.address
+  if (!address || address.length < 5) return
+
+  isGeocoding.value = true
+  geocodeError.value = ''
+
+  try {
+    const res = await fetch(`${API_URL}/geocode?address=${encodeURIComponent(address)}&name=${encodeURIComponent(schoolForm.value.name)}`)
+    const data = await res.json()
+
+    if (data.status === 'SUCCESS' && data.latitude && data.longitude) {
+      const lat = parseFloat(data.latitude)
+      const lng = parseFloat(data.longitude)
+      
+      if (mapMarker.value) {
+          mapMarker.value.setLatLng([lat, lng])
+      } else {
+          mapMarker.value = L.marker([lat, lng]).addTo(mapInstance.value)
+      }
+      
+      mapInstance.value.setView([lat, lng], 16)
+      
+      // Sync form with geocoded result
+      schoolForm.value.latitude = lat
+      schoolForm.value.longitude = lng
+    } else {
+      // Don't remove marker immediately if user is just typing, but maybe warn?
+      // Actually requirement says: "If geocoding fails, do not place a marker; Display a clear error"
+      geocodeError.value = 'Address not found on map'
+      if (mapMarker.value) {
+        mapInstance.value.removeLayer(mapMarker.value)
+        mapMarker.value = null
+        schoolForm.value.latitude = null
+        schoolForm.value.longitude = null
+      }
+    }
+  } catch (e) {
+    console.error('Map update error:', e)
+    geocodeError.value = 'Failed to load map data'
+  } finally {
+    isGeocoding.value = false
+  }
+}
+
+// Watch address change with debounce
+watch(() => schoolForm.value.address, (newVal) => {
+  if (!newVal) return
+  if (debounceTimer) clearTimeout(debounceTimer)
+  debounceTimer = setTimeout(() => {
+    updateMapFromAddress()
+  }, 1000)
+})
+
+// Watch view change to init map when Registration tab opens
+watch(currentView, async (newVal) => {
+  if (newVal === 'registration') {
+    // Reset map instance if it exists but container is new (should rely on cleanup, but just in case)
+    if (mapInstance.value) {
+       mapInstance.value.remove()
+       mapInstance.value = null
+       mapMarker.value = null
+    }
+
+    await nextTick()
+    // Give a slight delay for transition/rendering
+    setTimeout(() => {
+       initMap()
+       // If address is already pre-filled (e.g. from OCR), update map
+       if (schoolForm.value.address) {
+          updateMapFromAddress()
+       }
+    }, 300)
+  } else {
+    // Cleanup map when leaving registration view
+    if (mapInstance.value) {
+       mapInstance.value.remove()
+       mapInstance.value = null
+       mapMarker.value = null
+    }
+  }
+})
+
 onMounted(async () => {
   await refreshData()
 })
@@ -208,17 +442,88 @@ const searchQuery = ref('')
 const rawSearchInput = ref('')
 const isSearching = ref(false)
 let searchTimeout = null
+const searchError = ref('')
+
+function isValidSearchInput(str) {
+  if (!str) return true
+  if (str.length > 100) return false
+  // Allow letters, numbers, spaces, period, comma, apostrophe, hyphen, ampersand
+  return /^[a-zA-Z0-9\s.,'&-]+$/.test(str)
+}
 
 watch(rawSearchInput, (newVal) => {
   isSearching.value = true
   if (searchTimeout) clearTimeout(searchTimeout)
   searchTimeout = setTimeout(() => {
-    searchQuery.value = newVal
+    const trimmed = newVal.trim()
+    if (!isValidSearchInput(trimmed)) {
+      searchError.value = 'Invalid search. Use letters, numbers, spaces, period or comma.'
+      isSearching.value = false
+      return
+    }
+    searchError.value = ''
+    searchQuery.value = trimmed
     isSearching.value = false
   }, 500)
 })
 
-// Level options for Upload Permit (multi-select like mockup)
+// Confirmation state handling is unified at the bottom of the script
+
+// ─── Map Logic for Admin View ──────────────────────────────────────────────────────────────
+const selectedSchool = ref(null)
+
+const mapContainerView = ref(null)
+let mapInstanceView = null
+let markerInstanceView = null
+
+// Watch selected school to update map
+watch(selectedSchool, async (school) => {
+  if (!school) {
+     if (mapInstanceView) {
+        mapInstanceView.remove()
+        mapInstanceView = null
+     }
+     return
+  }
+  
+  await nextTick()
+  if (!mapContainerView.value) return
+
+  const lat = school.latitude
+  const lng = school.longitude
+  
+  if (lat && lng) {
+     if (!mapInstanceView) {
+        mapInstanceView = L.map(mapContainerView.value).setView([lat, lng], 15)
+        L.tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, {
+           maxZoom: 19,
+           attribution: '© OpenStreetMap'
+        }).addTo(mapInstanceView)
+     } else {
+        mapInstanceView.setView([lat, lng], 15)
+        mapInstanceView.invalidateSize()
+     }
+     
+     if (markerInstanceView) markerInstanceView.remove()
+     markerInstanceView = L.marker([lat, lng], { draggable: false }).addTo(mapInstanceView)
+  } else {
+     // If no coordinates, maybe show a "No map data" state or default view
+     if (mapInstanceView) {
+        mapInstanceView.setView([14.5995, 120.9842], 10) // Default to Manila
+        mapInstanceView.invalidateSize()
+     }
+     if (markerInstanceView) markerInstanceView.remove()
+  }
+})
+
+function selectSchool(id) {
+  const group = searchResults.value.find(g => g.schoolId === id)
+  if (group) {
+    selectedSchool.value = group
+  }
+}
+
+// ─── Level options for Upload Permit ─────────────────────────────────────────
 const levelOptions = [
   { value: 'Kindergarten', label: 'Kindergarten' },
   { value: 'Elementary', label: 'Elementary' },
@@ -227,13 +532,41 @@ const levelOptions = [
 ]
 
 // ─── Trash Bin Logic ─────────────────────────────────────────────────────────
-const trashTab = ref('schools')
 const trashSchools = ref([])
 const trashPermits = ref([])
 const trashLoading = ref(false)
 const trashAnimating = ref(false)
 
-const trashCount = computed(() => trashSchools.value.length + trashPermits.value.length)
+const unifiedTrash = computed(() => {
+  const schoolIds = new Set(trashSchools.value.map(s => s.id))
+  
+  const displaySchools = trashSchools.value.map(s => ({
+    id: s.id,
+    type: 'school',
+    title: s.name,
+    subtitle: s.address,
+    deletedAt: s.deletedAt,
+    badgeColor: 'bg-purple-100 text-purple-700',
+    icon: 'School' // We'll render icon dynamically if needed, or just use badge
+  }))
+  
+  const displayPermits = trashPermits.value
+    .filter(p => !schoolIds.has(p.schoolId))
+    .map(p => ({
+      id: p.id,
+      type: 'permit',
+      title: getSchoolName(p.schoolId),
+      subtitle: `Permit No: ${p.permitNumber} (SY ${p.schoolYear})`,
+      deletedAt: p.deletedAt,
+      badgeColor: 'bg-blue-100 text-blue-700'
+    }))
+    
+  return [...displaySchools, ...displayPermits].sort((a, b) => 
+    new Date(b.deletedAt) - new Date(a.deletedAt)
+  )
+})
+
+const trashCount = computed(() => unifiedTrash.value.length)
 
 watch(currentView, (newVal) => {
   if (newVal === 'trash') fetchTrash()
@@ -309,39 +642,6 @@ async function deleteForever(type, id) {
     }
   } catch (err) {
     showToast('Failed to delete item', 'error')
-  }
-}
-
-// ─── Create New School ──────────────────────────────────────────────────────
-const schoolForm = ref({
-  name: '',
-  type: 'Private', // Default to Private
-  address: '',
-  fileName: '',
-  file: null, // For OCR upload
-  filePreviewUrl: null,
-  ocrLoading: false,
-  // Combined Flow Fields
-  levels: [],
-  schoolYear: '',
-  permitNumber: '',
-  strands: [],
-  extractedText: '',
-  permits: [{ permitNumber: '', schoolYear: '', levels: [], strands: [] }]
-})
-const schoolFormErrors = ref({})
-
-// Strict Address Input Validation
-function sanitizeAddressInput(e) {
-  const input = e.target.value
-  // Allow only alphanumeric (A-Z, a-z, 0-9), space, period, and comma
-  const sanitized = input.replace(/[^a-zA-Z0-9\s.,]/g, '')
-  
-  // Update if changed
-  if (input !== sanitized) {
-    schoolForm.value.address = sanitized
-    // Force DOM update to reflect sanitized value immediately
-    e.target.value = sanitized
   }
 }
 
@@ -490,7 +790,7 @@ async function onSchoolFileChange(e) {
     let foundAddress = ''
     
     // Strategy 1: "located at [Address]" (Strongest)
-    const locatedMatch = cleanTextForName.match(/located\s+at\s+([A-Z0-9\s.,&'-]+?)(?:\s+(?:approving|approves|granting|granted|hereby|which|where|to\s+operate|subject\s+to|pursuant|under|following|\(School\))|$)/i)
+    const locatedMatch = cleanTextForName.match(/located\s+at\s+([A-Z0-9\s.,&'-]+?)(?:\s+(?:approving|approves|granting|granted|hereby|which|where|to\s+operate|subject\s+to|pursuant|under|following|through|is\s+hereby|\(School\))|$)/i)
     if (locatedMatch && locatedMatch[1]) {
        foundAddress = locatedMatch[1].trim().replace(/[.,;:]+$/, '')
     }
@@ -529,6 +829,15 @@ async function onSchoolFileChange(e) {
         if (hasCity || hasProvince || hasStreet) {
            let cleaned = line.replace(/^(located at|address[:.]?)\s*/i, '')
            cleaned = cleaned.replace(/[.,;:]+$/, '')
+           // Stop at common delimiters to avoid grabbing subsequent sentence parts
+           const stopWords = [' through ', ' subject to ', ' pursuant ', ' under ', ' following ', ' is hereby ']
+           for (const word of stopWords) {
+             const idx = cleaned.toLowerCase().indexOf(word)
+             if (idx !== -1) {
+               cleaned = cleaned.substring(0, idx)
+               break
+             }
+           }
            if (cleaned.split(' ').length > 2) {
               foundAddress = cleaned
               break
@@ -538,7 +847,10 @@ async function onSchoolFileChange(e) {
     }
     
     if (foundName) schoolForm.value.name = foundName
-    if (foundAddress) schoolForm.value.address = foundAddress
+    if (foundAddress) {
+       // Apply strict sanitization to OCR address result
+       schoolForm.value.address = sanitizeAddressString(foundAddress)
+    }
 
     // Fallback: Use Filename as School Name if still empty and filename looks like a name
     if (!schoolForm.value.name && file.name) {
@@ -592,6 +904,8 @@ function setCreateTab(tab) {
   const commonFields = {
     name: '',
     address: '',
+    latitude: null,
+    longitude: null,
     file: null,
     fileName: '',
     filePreviewUrl: null,
@@ -666,6 +980,8 @@ async function createSchool() {
     name: schoolForm.value.name.trim(),
     type: schoolForm.value.type,
     address: (schoolForm.value.address ?? '').trim(),
+    latitude: schoolForm.value.latitude,
+    longitude: schoolForm.value.longitude
   }
 
   try {
@@ -731,12 +1047,23 @@ async function createSchool() {
         name: '', 
         type: createTab.value === 'homeschool' ? 'Homeschooling' : 'Private', 
         address: '', 
+        latitude: null,
+        longitude: null,
         extractedText: '',
         file: null,
         fileName: '',
         filePreviewUrl: null,
         ocrLoading: false,
         permits: [{ permitNumber: '', schoolYear: '', levels: [], strands: [] }]
+      }
+      
+      // Clear map marker
+      if (mapMarker.value) {
+         mapInstance.value?.removeLayer(mapMarker.value)
+         mapMarker.value = null
+      }
+      if (mapInstance.value) {
+         mapInstance.value.setView([14.277, 121.123], 13)
       }
       schoolFormErrors.value = {}
       
@@ -785,56 +1112,121 @@ function showToast(message, type = 'success') {
 function extractPermitDetails(text) {
   if (!text || typeof text !== 'string' || !text.trim()) return []
   
-  const t = text.replace(/\s+/g, ' ').trim()
-  console.log('Extracted Text for Permit Detection:', t)
+  // 1. Pre-process: Normalize whitespace and fix common OCR typos in keywords
+  let t = text.replace(/\s+/g, ' ').trim()
+  
+  // Fuzzy replacements for key terms
+  const replacements = [
+    { pattern: /G[o0]vern?ment\s+P[e3]rmit/gi, replacement: 'Government Permit' },
+    { pattern: /G[o0]vern?ment\s+Rec[o0]gni[t7]ion/gi, replacement: 'Government Recognition' },
+    { pattern: /DepEd\s+P[e3]rmit/gi, 'replacement': 'Government Permit' },
+    { pattern: /Auth[o0]rity\s+to\s+Operate/gi, replacement: 'Authority to Operate' },
+    { pattern: /Provi[s5]ional\s+P[e3]rmit/gi, replacement: 'Provisional Permit' },
+    { pattern: /s\.\s*(\d{4})/gi, replacement: 's. $1' }, // Ensure space after s.
+    { pattern: /series\s+of/gi, replacement: 's.' },
+    { pattern: /dated/gi, replacement: 's.' } // Treat "dated" as "s." for parsing
+  ]
+  
+  replacements.forEach(({ pattern, replacement }) => {
+    t = t.replace(pattern, replacement)
+  })
+  
+  console.log('Extracted Text (Normalized):', t)
   const permits = []
 
   // Helper: Detect Strands (Full names & Abbreviations)
   const detectStrands = (txt) => {
     const found = []
+    
     // STEM
-    if (/STEM|Science,? Technology,? Engineering,? (?:and|&) Mathematics/i.test(txt)) found.push('STEM')
+    if (/STEM|Science,? Technology,? Engineering,? (?:and|&) Mathematics|Science\s+and\s+Technology/i.test(txt)) {
+       if (!found.includes('STEM')) found.push('STEM')
+    }
+    
     // ABM
-    if (/ABM|Accountancy,? Business,? (?:and|&) Management/i.test(txt)) found.push('ABM')
+    if (/ABM|Accountancy,? Business,? (?:and|&) Management|Business\s+and\s+Management/i.test(txt)) {
+       if (!found.includes('ABM')) found.push('ABM')
+    }
+    
     // HUMSS
-    if (/HUMSS|Humanities (?:and|&) Social Sciences/i.test(txt)) found.push('HUMSS')
+    if (/HUMSS|Humanities (?:and|&) Social Sciences|Humanities/i.test(txt)) {
+       if (!found.includes('HUMSS')) found.push('HUMSS')
+    }
+    
     // GAS
-    if (/GAS|General Academic/i.test(txt)) found.push('GAS')
-    // TVL
-    if (/TVL|Technical[- ]Vocational[- ]Livelihood/i.test(txt)) found.push('TVL')
+    if (/GAS|General Academic/i.test(txt)) {
+       if (!found.includes('GAS')) found.push('GAS')
+    }
+    
+    // TVL & Specializations
+    const tvlKeywords = [
+       'TVL', 
+       'Technical[- ]Vocational[- ]Livelihood',
+       'Tech[- ]Voc',
+       'ICT', 'Information and Communications Technology', 'Computer Systems Servicing', 'Programming', 'Animation',
+       'Home Economics', 'HE', 'Cookery', 'Bread and Pastry', 'Food and Beverage', 'Housekeeping', 'Caregiving', 'Dressmaking', 'Tailoring', 'Wellness Massage',
+       'Agri-Fishery', 'AFA', 'Agriculture', 'Fishery',
+       'Industrial Arts', 'IA', 'Automotive', 'Welding', 'Electrical Installation', 'Electronics', 'Carpentry', 'Plumbing', 'Shielded Metal Arc'
+    ]
+    const tvlRegex = new RegExp(tvlKeywords.join('|'), 'i')
+    if (tvlRegex.test(txt)) {
+       if (!found.includes('TVL')) found.push('TVL')
+    }
+    
     // Sports
-    if (/Sports/i.test(txt)) found.push('Sports')
+    if (/Sports/i.test(txt)) {
+       if (!found.includes('Sports')) found.push('Sports')
+    }
+    
     // Arts and Design
-    if (/Arts (?:and|&) Design/i.test(txt)) found.push('Arts and Design')
+    if (/Arts (?:and|&) Design|Design/i.test(txt)) {
+       if (!found.includes('Arts and Design')) found.push('Arts and Design')
+    }
+    
     return found
   }
   
-  // Strategy 1: Standard Government Permit Pattern
-  // Matches: "Government Permit (R - IVA) No. SHS-089, s. 2018"
-  // Generalized to handle optional parenthesized text (like Region) and commas
-  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4})/gi
+  // Helper: Clean Permit Number
+  const cleanPermitNumber = (raw) => {
+      // Remove trailing punctuation
+      let clean = raw.replace(/[.,:;]+$/, '').trim()
+      // Fix common char swaps in numbers (O -> 0, l/I -> 1) if mixed
+      // Only apply if it looks like it should be alphanumeric (e.g., "SHS-O89" -> "SHS-089")
+      if (/[A-Z]+-\w+/.test(clean)) {
+          const parts = clean.split('-')
+          if (parts.length > 1) {
+              // Usually the second part is numeric
+              parts[1] = parts[1].replace(/O/g, '0').replace(/[lI]/g, '1')
+              clean = parts.join('-')
+          }
+      }
+      return clean
+  }
+
+  // Strategy 1: Strong "Keyword ... No. ... s. Year" Pattern
+  // Matches: "Government Permit (R-IVA) No. SHS-089 s. 2018"
+  const strongRegex = /(?:Government\s+Permit|Government\s+Recognition|Authority\s+to\s+Operate|Provisional\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+?)[\s,.]+(?:s\.)\s*(\d{4}(?:[-]\d{4})?)/gi
   
   let match
-  while ((match = gpRegex.exec(t)) !== null) {
-    const pNum = match[1].trim()
-    const sYear = match[2].trim()
+  while ((match = strongRegex.exec(t)) !== null) {
+    let pNum = cleanPermitNumber(match[1])
+    let sYear = match[2].trim()
     
-    // Stop if pNum becomes too long (likely captured garbage text due to \s)
-    if (pNum.length > 25) continue
+    // Validation: Permit number shouldn't be too long or contain too many spaces
+    if (pNum.length > 30 || (pNum.match(/\s/g) || []).length > 3) continue
     
     const levels = []
     let strands = []
     
     // Infer Level from Permit Number Prefix
-    if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
-    else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
-    else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School') 
-    else if (/^SHS[-]/i.test(pNum)) levels.push('Senior High School')
+    if (/^K[-]/i.test(pNum) || /Kindergarten/i.test(pNum)) levels.push('Kindergarten')
+    else if (/^E[-]/i.test(pNum) || /Elementary/i.test(pNum)) levels.push('Elementary')
+    else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum) || /Junior/i.test(pNum)) levels.push('Junior High School') 
+    else if (/^SHS[-]/i.test(pNum) || /Senior/i.test(pNum)) levels.push('Senior High School')
     
-    // Context fallback (look around the match)
+    // Context fallback
     if (levels.length === 0) {
-       // Increased context window to 1000 chars to catch "Senior High School" if it's far away
-       const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
+       const context = t.substring(Math.max(0, match.index - 800), match.index + 800)
        if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
        if (/Elementary/i.test(context)) levels.push('Elementary')
        if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
@@ -842,66 +1234,42 @@ function extractPermitDetails(text) {
     }
 
     if (levels.includes('Senior High School')) {
-       // Search strands in a larger context (forward 2000 chars)
        strands = detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000))
     }
 
     permits.push({
       permitNumber: pNum,
       schoolYear: sYear,
-      levels: [...new Set(levels)], // Dedupe
+      levels: [...new Set(levels)],
       strands: strands
     })
   }
 
-  // Strategy 2: Government Recognition Pattern
-  // Added support for (Region ...) and relaxed "No." matching
-  const grRegex = /Government\s+Recognition(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)?[\s,.]*(?:s\.?|series\s+of)\s*(\d{4})/gi
-  while ((match = grRegex.exec(t)) !== null) {
-      const pNum = match[1] ? match[1].trim() : 'Gov. Rec.'
-      if (pNum.length > 25) continue
-      const sYear = match[2]
-      
-      const levels = []
-      const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
-      
-      if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
-      if (/Elementary/i.test(context)) levels.push('Elementary')
-      if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
-      if (/Senior\s*High/i.test(context)) levels.push('Senior High School')
-
-      permits.push({
-          permitNumber: pNum,
-          schoolYear: sYear,
-          levels: [...new Set(levels)],
-          strands: levels.includes('Senior High School') ? detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000)) : []
-      })
-  }
-
-  // Strategy 3: Loose "No. X-Y s. Z" (Relaxed)
-  // Matches "No. 001 s. 2024", "No. K-123 s. 2024", "No. 123-A s. 2024"
-  // Must have "No." or "Number" to avoid false positives in random text
-  // Updated to allow comma before s.
-  const looseRegex = /(?:No\.?|Number)[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4})/gi
+  // Strategy 2: Relaxed "No. ... s. Year" (fallback)
+  // Only if no strong matches, or to catch additional ones
+  // Must look like a structured ID (e.g., contains dashes or digits) to avoid false positives
+  const looseRegex = /(?:No\.?|Number)[\s:.]*([A-Z0-9-]{3,20})[\s,.]+(?:s\.)\s*(\d{4}(?:[-]\d{4})?)/gi
+  
   while ((match = looseRegex.exec(t)) !== null) {
-      const pNum = match[1].replace(/\s+/g, '').trim()
+      let pNum = cleanPermitNumber(match[1])
       const sYear = match[2].trim()
       
-      // Validation: Length check (avoid "No. I s. 2024" if 'I' is just a pronoun or garbage)
-      if (pNum.length < 2 || pNum.length > 25) continue
-      
-      // Check if this permit is already found
+      // Skip if already found
       if (permits.some(p => p.permitNumber === pNum)) continue;
 
+      // Basic validation for loose match
+      // Must contain at least one digit or a hyphen to be considered a permit number
+      if (!/[\d-]/.test(pNum)) continue;
+
       const levels = []
-      // Check prefix or surrounding context
+      // Check prefix
       if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
       else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
       else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School') 
       else if (/^SHS[-]/i.test(pNum)) levels.push('Senior High School')
       
       if (levels.length === 0) {
-          const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
+          const context = t.substring(Math.max(0, match.index - 800), match.index + 800)
           if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
           if (/Elementary/i.test(context)) levels.push('Elementary')
           if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
@@ -911,7 +1279,7 @@ function extractPermitDetails(text) {
       permits.push({
           permitNumber: pNum,
           schoolYear: sYear,
-          levels: levels,
+          levels: [...new Set(levels)],
           strands: levels.includes('Senior High School') ? detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000)) : []
       })
   }
@@ -920,6 +1288,7 @@ function extractPermitDetails(text) {
   const uniquePermits = []
   const seen = new Set()
   permits.forEach(p => {
+      // Normalize year for dedupe (2024 -> 2024-2025? Optional, keeping raw for now)
       const key = `${p.permitNumber}-${p.schoolYear}`
       if (!seen.has(key)) {
           seen.add(key)
@@ -1289,15 +1658,7 @@ function closePreview() {
   previewPermit.value = null
 }
 
-const selectedSchool = ref(null)
 const isRenewingPermit = ref(false)
-
-function viewSchoolDetails(schoolId) {
-  const group = searchResults.value.find(g => g.schoolId === schoolId)
-  if (group) {
-    selectedSchool.value = group
-  }
-}
 
 function openRenewPermit(schoolId) {
   resetPermitForm()
@@ -1323,11 +1684,11 @@ function closeSchoolDetails() {
 // ─── Public Search: filtered results ────────────────────────────────────────
 const filterType = ref('All') // 'All' | 'Private' | 'Homeschooling'
 
-const searchResults = computed(() => {
-  const q = searchQuery.value.trim().toLowerCase()
+// ─── Base grouping for cards (used by search and default list) ──────────────
+const visibleSchoolLimit = ref(5)
+
+const groupedResults = computed(() => {
   const type = filterType.value
-  
-  // Group permits by schoolId
   const grouped = {}
   permits.value.forEach(p => {
     if (!grouped[p.schoolId]) {
@@ -1338,14 +1699,15 @@ const searchResults = computed(() => {
         schoolAddress: s ? s.address : '',
         schoolType: s ? s.type : 'Private',
         status: s ? s.status : 'No Permits',
+        latitude: s ? s.latitude : null,
+        longitude: s ? s.longitude : null,
         permits: []
       }
     }
     grouped[p.schoolId].permits.push(p)
   })
-  
   let results = Object.values(grouped)
-  
+
   // Handle Duplicate Names (Branch Detection)
   const nameCounts = {}
   results.forEach(r => {
@@ -1362,15 +1724,34 @@ const searchResults = computed(() => {
        r.branchIdentifier = match ? match[1].trim() : addr.substring(0, 20) + '...'
     }
   })
+
+  if (type !== 'All') {
+    results = results.filter((g) => g.schoolType === type)
+  }
+  return results
+})
+
+const defaultGroups = computed(() => {
+  return groupedResults.value.slice(0, visibleSchoolLimit.value)
+})
+
+const totalGroupedCount = computed(() => groupedResults.value.length)
+
+function loadMoreSchools() {
+  visibleSchoolLimit.value += 5
+}
+
+watch(filterType, () => {
+  visibleSchoolLimit.value = 5
+})
+
+const searchResults = computed(() => {
+  const q = searchQuery.value.trim().toLowerCase()
+  let results = groupedResults.value
   
   // Filter by query (school name)
   if (q) {
     results = results.filter((g) => g.schoolName.toLowerCase().includes(q))
-  }
-  
-  // Filter by type
-  if (type !== 'All') {
-    results = results.filter((g) => g.schoolType === type)
   }
   
   return results
@@ -1378,14 +1759,7 @@ const searchResults = computed(() => {
 
 const showEmptyState = computed(() => {
   const q = searchQuery.value.trim()
-  // If no query and filtering 'All', maybe show all? 
-  // Original logic: "return !q || searchResults.value.length === 0"
-  // Let's change to: show empty state if no query, regardless of filter, 
-  // OR if there are no results found for the query/filter combo.
-  // Actually, usually search page is empty until you search.
-  // But if I want to "sort whether private or public", maybe listing them is better?
-  // Let's stick to "search first" but respect the filter.
-  return !q || searchResults.value.length === 0
+  return !q
 })
 </script>
 
@@ -1529,7 +1903,9 @@ const showEmptyState = computed(() => {
                 type="text"
                 placeholder="Search for a school..."
                 class="w-full pl-12 pr-4 py-3 rounded-lg border border-slate-300 bg-white focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none text-slate-800 placeholder-slate-400"
+                :class="searchError ? 'border-red-300 focus:ring-red-500 focus:border-red-500' : ''"
               />
+              <div v-if="searchError" class="mt-1 text-xs text-red-600">{{ searchError }}</div>
             </div>
             <CustomSelect
               v-model="filterType"
@@ -1548,141 +1924,293 @@ const showEmptyState = computed(() => {
             <p class="text-slate-600 font-medium">Searching...</p>
          </div>
 
-         <!-- Empty state -->
-         <div
-            v-else-if="showEmptyState"
-            class="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center"
-         >
-            <div class="inline-flex items-center justify-center w-20 h-20 rounded-full bg-sky-50 text-sky-500 mb-4">
-              <Search :size="40" stroke-width="1.5" />
-            </div>
-            <p class="text-slate-800 font-medium mb-1">Enter a school name above to search</p>
-            <p class="text-sm text-slate-500">Start typing to find school permit information</p>
-         </div>
+          <!-- Available Schools List (Default State) -->
+         <!-- Unified List Container with Sticky Map -->
+      <div v-else-if="showEmptyState || searchResults.length > 0" class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <!-- Left: List of Schools -->
+          <div class="lg:col-span-2 space-y-4">
+            
+            <!-- Default View: Available Schools Card -->
+            <div v-if="showEmptyState" class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col max-h-[600px]">
+              <div class="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center sticky top-0 z-10">
+                 <div class="flex items-center gap-2">
+                   <Building2 :size="18" class="text-slate-400" />
+                   <h3 class="font-semibold text-slate-700">Available Schools</h3>
+                 </div>
+                 <span class="text-xs text-slate-500 font-medium px-2 py-1 bg-white rounded border border-slate-200">
+                    {{ totalGroupedCount }} total
+                 </span>
+              </div>
 
-         <!-- Result cards -->
-         <TransitionGroup 
-           name="trash-fly" 
-           tag="ul" 
-           class="space-y-4 relative" 
-           v-else
-         >
-            <li
-              v-for="group in searchResults"
-              :key="group.schoolId"
-              class="group bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden relative z-10 cursor-pointer hover:border-sky-300 transition-colors"
-              @click="viewSchoolDetails(group.schoolId)"
-            >
-              <div class="p-5">
-                <div class="flex flex-col sm:flex-row sm:items-center justify-between mb-4 gap-2">
-                  <div class="flex items-center gap-3">
-                    <div>
-                      <div class="flex items-center gap-2 mb-1">
-                        <h3 class="font-semibold text-slate-800 text-lg">
-                          {{ group.schoolName }}
-                          <span v-if="group.isDuplicateName" class="text-xs font-normal text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded ml-2">
-                            {{ group.branchIdentifier }}
-                          </span>
-                        </h3>
-                        <span :class="getStatusBadgeClass(group.status)" class="text-xs font-medium px-2 py-0.5 rounded-full border">
-                          {{ group.status }}
-                        </span>
+              <div class="overflow-y-auto p-4 space-y-4 custom-scrollbar">
+                  <ul class="space-y-4 relative">
+                    <li
+                      v-for="group in defaultGroups"
+                      :key="group.schoolId"
+                      class="group bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden relative z-10 cursor-pointer transition-all hover:border-sky-300"
+                      :class="selectedSchoolId === group.schoolId ? 'ring-2 ring-sky-500 border-transparent' : ''"
+                      @click="selectSchool(group.schoolId)"
+                    >
+                      <div class="p-5">
+                        <div class="flex flex-col sm:flex-row sm:items-center justify-between mb-4 gap-2">
+                          <div class="flex items-center gap-3">
+                            <div>
+                              <h3 class="font-semibold text-slate-800 text-lg">
+                                {{ group.schoolName }}
+                                <span v-if="group.isDuplicateName" class="text-xs font-normal text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded ml-2">
+                                  {{ group.branchIdentifier }}
+                                </span>
+                              </h3>
+                              <p class="text-sm text-slate-500">{{ group.schoolAddress }}</p>
+                            </div>
+                            <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                              <button @click.stop="openEditSchool(group.schoolId)" class="p-1.5 text-slate-400 hover:text-sky-600 rounded-lg hover:bg-sky-50 transition-colors" title="Edit School">
+                                <Pencil :size="14" />
+                              </button>
+                              <button @click.stop="deleteSchool(group.schoolId)" class="p-1.5 text-slate-400 hover:text-red-600 rounded-lg hover:bg-red-50 transition-colors" title="Delete School">
+                                <Trash2 :size="14" />
+                              </button>
+                            </div>
+                          </div>
+                          <div class="flex gap-2 shrink-0">
+                            <span 
+                              class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
+                              :class="{
+                                'bg-purple-50 text-purple-700 border-purple-200': group.schoolType === 'Private',
+                                'bg-blue-50 text-blue-700 border-blue-200': group.schoolType === 'Public',
+                                'bg-orange-50 text-orange-700 border-orange-200': group.schoolType === 'Homeschooling'
+                              }"
+                            >
+                              {{ group.schoolType }}
+                            </span>
+                            <span 
+                              class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
+                              :class="{
+                                'bg-emerald-50 text-emerald-700 border-emerald-200': getOverallSchoolStatus(group.permits).color === 'green',
+                                'bg-amber-50 text-amber-700 border-amber-200': getOverallSchoolStatus(group.permits).color === 'yellow',
+                                'bg-red-50 text-red-700 border-red-200': getOverallSchoolStatus(group.permits).color === 'red',
+                                'bg-gray-50 text-gray-700 border-gray-200': getOverallSchoolStatus(group.permits).color === 'gray'
+                              }"
+                            >
+                              Status: {{ getOverallSchoolStatus(group.permits).label }}
+                            </span>
+                          </div>
+                        </div>
+    
+                        <!-- List of permits -->
+                        <div class="space-y-4">
+                          <div 
+                            v-for="(p) in group.permits" 
+                            :key="p.id" 
+                            class="group/permit pt-4 first:pt-0 border-t border-slate-100 first:border-0"
+                          >
+                            <div class="flex flex-wrap gap-2 mb-2">
+                              <span
+                                v-for="level in p.levels"
+                                :key="level"
+                                :class="{
+                                  'bg-emerald-100 text-emerald-800': getStatus(p.schoolYear).color === 'green',
+                                  'bg-amber-100 text-amber-800': getStatus(p.schoolYear).color === 'yellow',
+                                  'bg-red-100 text-red-800': getStatus(p.schoolYear).color === 'red',
+                                  'bg-gray-100 text-gray-800': getStatus(p.schoolYear).color === 'gray',
+                                }"
+                                class="inline-flex items-center px-2.5 py-1 rounded-md text-sm font-medium"
+                              >
+                                {{ level }}: {{ getStatus(p.schoolYear).label }}
+                              </span>
+                            </div>
+                            
+                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-0">
+                              <div class="text-sm text-slate-600 flex items-center gap-2">
+                                <span>Permit No. {{ p.permitNumber || '—' }}</span> 
+                                <span class="opacity-50">|</span> 
+                                <span>SY {{ p.schoolYear || '—' }}</span>
+                                <span class="text-xs text-slate-400">Edit via school</span>
+                              </div>
+                              <button
+                                v-if="p.filePreviewUrl"
+                                @click.stop="openPreview(p)"
+                                class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-sky-50 text-sky-700 border border-sky-200 hover:bg-sky-100 transition-colors"
+                              >
+                                <FileImage :size="16" />
+                                View File
+                              </button>
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                      <p class="text-sm text-slate-500">{{ group.schoolAddress }}</p>
-                    </div>
-                    <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button @click="openEditSchool(group.schoolId)" class="p-1.5 text-slate-400 hover:text-sky-600 rounded-lg hover:bg-sky-50 transition-colors" title="Edit School">
-                        <Pencil :size="14" />
-                      </button>
-                      <button @click="deleteSchool(group.schoolId)" class="p-1.5 text-slate-400 hover:text-red-600 rounded-lg hover:bg-red-50 transition-colors" title="Delete School">
-                        <Trash2 :size="14" />
-                      </button>
-                    </div>
-                  </div>
-                  <div class="flex gap-2">
-                    <span 
-                      class="px-2 py-0.5 rounded text-xs font-medium border"
-                      :class="{
-                        'bg-purple-50 text-purple-700 border-purple-200': group.schoolType === 'Private',
-                        'bg-blue-50 text-blue-700 border-blue-200': group.schoolType === 'Public',
-                        'bg-orange-50 text-orange-700 border-orange-200': group.schoolType === 'Homeschooling'
-                      }"
-                    >
-                      {{ group.schoolType }}
-                    </span>
-                    <span 
-                      class="px-2 py-0.5 rounded text-xs font-medium border"
-                      :class="{
-                        'bg-emerald-50 text-emerald-700 border-emerald-200': getOverallSchoolStatus(group.permits).color === 'green',
-                        'bg-amber-50 text-amber-700 border-amber-200': getOverallSchoolStatus(group.permits).color === 'yellow',
-                        'bg-red-50 text-red-700 border-red-200': getOverallSchoolStatus(group.permits).color === 'red',
-                        'bg-gray-50 text-gray-700 border-gray-200': getOverallSchoolStatus(group.permits).color === 'gray'
-                      }"
-                    >
-                      Status: {{ getOverallSchoolStatus(group.permits).label }}
-                    </span>
-                  </div>
-                </div>
+                    </li>
+                  </ul>
 
-                <!-- List of permits -->
-                <div class="space-y-4">
-                  <div 
-                    v-for="(p) in group.permits" 
-                    :key="p.id" 
-                    class="group/permit pt-4 first:pt-0 border-t border-slate-100 first:border-0"
-                  >
-                    <div class="flex flex-wrap gap-2 mb-2">
-                      <span
-                        v-for="level in p.levels"
-                        :key="level"
+                  <div v-if="defaultGroups.length === 0" class="text-center py-12">
+                     <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-slate-50 text-slate-400 mb-3">
+                       <Search :size="32" stroke-width="1.5" />
+                     </div>
+                     <p class="text-slate-500 font-medium">No schools found</p>
+                 </div>
+
+                 <button 
+                    v-if="defaultGroups.length < totalGroupedCount"
+                   @click="loadMoreSchools"
+                   class="w-full py-3 text-sm text-sky-600 font-semibold hover:bg-sky-50 rounded-xl transition-colors border border-dashed border-sky-200 mt-2 flex items-center justify-center gap-2"
+                 >
+                   <span>See More</span>
+                   <span class="px-1.5 py-0.5 bg-sky-100 text-sky-700 rounded text-xs">
+                      {{ Math.min(5, totalGroupedCount - defaultGroups.length) }}
+                   </span>
+                 </button>
+              </div>
+           </div>
+
+           <!-- Search Results View -->
+           <template v-else>
+               <div 
+                v-for="group in searchResults" 
+                :key="group.schoolId"
+                class="group bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden relative z-10 cursor-pointer transition-all hover:border-sky-300"
+                :class="selectedSchoolId === group.schoolId ? 'ring-2 ring-sky-500 border-transparent' : ''"
+                @click="selectSchool(group.schoolId)"
+              >
+                <!-- Search Result Card Content (Identical to previous) -->
+                <div class="p-5">
+                  <div class="flex flex-col sm:flex-row sm:items-center justify-between mb-4 gap-2">
+                    <div class="flex items-center gap-3">
+                      <div>
+                              <h3 class="font-semibold text-slate-800 text-lg">
+                                {{ group.schoolName }}
+                                <span v-if="group.isDuplicateName" class="text-xs font-normal text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded ml-2">
+                                  {{ group.branchIdentifier }}
+                                </span>
+                              </h3>
+                              <p class="text-sm text-slate-500">{{ group.schoolAddress }}</p>
+                            </div>
+                      <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <button @click.stop="openEditSchool(group.schoolId)" class="p-1.5 text-slate-400 hover:text-sky-600 rounded-lg hover:bg-sky-50 transition-colors" title="Edit School">
+                          <Pencil :size="14" />
+                        </button>
+                        <button @click.stop="deleteSchool(group.schoolId)" class="p-1.5 text-slate-400 hover:text-red-600 rounded-lg hover:bg-red-50 transition-colors" title="Delete School">
+                          <Trash2 :size="14" />
+                        </button>
+                      </div>
+                    </div>
+                    <div class="flex gap-2 shrink-0">
+                      <span 
+                        class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
                         :class="{
-                          'bg-emerald-100 text-emerald-800': getStatus(p.schoolYear).color === 'green',
-                          'bg-amber-100 text-amber-800': getStatus(p.schoolYear).color === 'yellow',
-                          'bg-red-100 text-red-800': getStatus(p.schoolYear).color === 'red',
-                          'bg-gray-100 text-gray-800': getStatus(p.schoolYear).color === 'gray',
+                          'bg-purple-50 text-purple-700 border-purple-200': group.schoolType === 'Private',
+                          'bg-blue-50 text-blue-700 border-blue-200': group.schoolType === 'Public',
+                          'bg-orange-50 text-orange-700 border-orange-200': group.schoolType === 'Homeschooling'
                         }"
-                        class="inline-flex items-center px-2.5 py-1 rounded-md text-sm font-medium"
                       >
-                        {{ level }}: {{ getStatus(p.schoolYear).label }}
+                        {{ group.schoolType }}
+                      </span>
+                      <span 
+                        class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
+                        :class="{
+                          'bg-emerald-50 text-emerald-700 border-emerald-200': getOverallSchoolStatus(group.permits).color === 'green',
+                          'bg-amber-50 text-amber-700 border-amber-200': getOverallSchoolStatus(group.permits).color === 'yellow',
+                          'bg-red-50 text-red-700 border-red-200': getOverallSchoolStatus(group.permits).color === 'red',
+                          'bg-gray-50 text-gray-700 border-gray-200': getOverallSchoolStatus(group.permits).color === 'gray'
+                        }"
+                      >
+                        Status: {{ getOverallSchoolStatus(group.permits).label }}
                       </span>
                     </div>
-                    
-                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-0">
-                      <div class="text-sm text-slate-600 flex items-center gap-2">
-                        <div class="flex flex-col sm:flex-row sm:items-center">
-                            <span v-if="p.permitNumber">Permit No. {{ p.permitNumber }}</span>
-                            <span v-if="p.permitNumber" class="hidden sm:inline text-slate-300 mx-2">|</span>
-                            <span :class="{'block text-xs text-slate-400 mt-1 sm:inline sm:text-sm sm:text-slate-600 sm:mt-0': p.permitNumber}">
-                              SY {{ p.schoolYear }}
-                            </span>
-                        </div>
-                        
-                        <div class="flex items-center gap-1 opacity-0 group-hover/permit:opacity-100 transition-opacity ml-2">
-                           <button @click="openEditPermit(p)" class="p-1 text-slate-400 hover:text-sky-600 transition-colors" title="Edit Permit">
-                              <Pencil :size="14" />
-                           </button>
-                           <button @click="deletePermit(p.id)" class="p-1 text-slate-400 hover:text-red-600 transition-colors" title="Delete Permit">
-                              <Trash2 :size="14" />
-                           </button>
-                        </div>
+                  </div>
+
+                  <!-- List of permits -->
+                  <div class="space-y-4">
+                    <div 
+                      v-for="(p) in group.permits" 
+                      :key="p.id" 
+                      class="group/permit pt-4 first:pt-0 border-t border-slate-100 first:border-0"
+                    >
+                      <div class="flex flex-wrap gap-2 mb-2">
+                        <span
+                          v-for="level in p.levels"
+                          :key="level"
+                          :class="{
+                            'bg-emerald-100 text-emerald-800': getStatus(p.schoolYear).color === 'green',
+                            'bg-amber-100 text-amber-800': getStatus(p.schoolYear).color === 'yellow',
+                            'bg-red-100 text-red-800': getStatus(p.schoolYear).color === 'red',
+                            'bg-gray-100 text-gray-800': getStatus(p.schoolYear).color === 'gray',
+                          }"
+                          class="inline-flex items-center px-2.5 py-1 rounded-md text-sm font-medium"
+                        >
+                          {{ level }}: {{ getStatus(p.schoolYear).label }}
+                        </span>
                       </div>
                       
-                      <button
-                        v-if="p.filePreviewUrl"
-                        type="button"
-                        @click="openPreview(p)"
-                        class="inline-flex items-center justify-center gap-2 px-3 py-1.5 text-sm font-medium text-sky-700 bg-sky-50 rounded-lg hover:bg-sky-100 transition-colors w-full sm:w-auto"
-                      >
-                        <FileImage :size="16" />
-                        View File
-                      </button>
-                      <span v-else class="text-sm text-slate-400 italic">No file attached</span>
+                      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-0">
+                        <div class="text-sm text-slate-600 flex items-center gap-2">
+                          <div class="flex flex-col sm:flex-row sm:items-center">
+                              <span v-if="p.permitNumber">Permit No. {{ p.permitNumber }}</span>
+                              <span v-if="p.permitNumber" class="hidden sm:inline text-slate-300 mx-2">|</span>
+                              <span :class="{'block text-xs text-slate-400 mt-1 sm:inline sm:text-sm sm:text-slate-600 sm:mt-0': p.permitNumber}">
+                                SY {{ p.schoolYear }}
+                              </span>
+                          </div>
+                          
+                          <div class="flex items-center gap-1 opacity-0 group-hover/permit:opacity-100 transition-opacity ml-2">
+                             <span class="text-xs text-slate-400">Edit via school</span>
+                          </div>
+                        </div>
+                        
+                        <button
+                          v-if="p.filePreviewUrl"
+                          type="button"
+                          @click.stop="openPreview(p)"
+                          class="inline-flex items-center justify-center gap-2 px-3 py-1.5 text-sm font-medium text-sky-700 bg-sky-50 rounded-lg hover:bg-sky-100 transition-colors w-full sm:w-auto"
+                        >
+                          <FileImage :size="16" />
+                          View File
+                        </button>
+                        <span v-else class="text-sm text-slate-400 italic">No file attached</span>
+                      </div>
                     </div>
                   </div>
                 </div>
               </div>
-            </li>
-          </TransitionGroup>
+           </template>
+
+          </div>
+
+          <!-- Right: Sticky Map -->
+          <div class="hidden lg:block lg:col-span-1">
+             <div class="sticky top-6">
+                <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col h-[calc(100vh-8rem)]">
+                   <div class="p-3 border-b border-slate-100 bg-slate-50 flex items-center justify-between">
+                      <h3 class="font-semibold text-slate-700 text-sm flex items-center gap-2">
+                         <MapPin :size="16" />
+                         School Location
+                      </h3>
+                      <span v-if="selectedSchool" class="text-xs text-slate-500 truncate max-w-[150px]">
+                         {{ selectedSchool.name }}
+                      </span>
+                      <span v-else class="text-xs text-slate-400 italic">Select a school</span>
+                   </div>
+                   <div class="flex-1 relative bg-slate-100">
+                      <div ref="mapContainerView" class="absolute inset-0 z-0"></div>
+                      <div v-if="!selectedSchool" class="absolute inset-0 flex items-center justify-center bg-slate-50/80 backdrop-blur-sm z-10 p-6 text-center">
+                         <div>
+                            <MapPin :size="48" class="text-slate-300 mx-auto mb-2" />
+                            <p class="text-slate-500 font-medium">Select a school to view map</p>
+                            <p class="text-xs text-slate-400 mt-1">Click on any school card from the list</p>
+                         </div>
+                      </div>
+                   </div>
+                </div>
+             </div>
+          </div>
+      </div>
+        
+        <div v-else class="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center">
+          <div class="inline-flex items-center justify-center w-20 h-20 rounded-full bg-slate-50 text-slate-400 mb-4">
+            <Search :size="40" stroke-width="1.5" />
+          </div>
+          <p class="text-slate-800 font-medium mb-1">No results found</p>
+          <p class="text-sm text-slate-500">Try a different school name or adjust the filter</p>
+        </div>
       </div>
     </main>
 
@@ -1698,68 +2226,40 @@ const showEmptyState = computed(() => {
           </div>
        </div>
 
-       <!-- Trash Tabs -->
-       <div class="flex gap-4 border-b border-slate-200 mb-6">
-          <button 
-             @click="trashTab = 'schools'"
-             class="pb-2 px-1 font-medium text-sm transition-colors border-b-2"
-             :class="trashTab === 'schools' ? 'border-red-500 text-red-600' : 'border-transparent text-slate-500 hover:text-slate-700'"
-          >
-             Deleted Schools ({{ trashSchools.length }})
-          </button>
-          <button 
-             @click="trashTab = 'permits'"
-             class="pb-2 px-1 font-medium text-sm transition-colors border-b-2"
-             :class="trashTab === 'permits' ? 'border-red-500 text-red-600' : 'border-transparent text-slate-500 hover:text-slate-700'"
-          >
-             Deleted Permits ({{ trashPermits.length }})
-          </button>
-       </div>
-
        <!-- Loading -->
        <div v-if="trashLoading" class="py-12 text-center text-slate-500">
           <Loader2 class="w-8 h-8 animate-spin mx-auto mb-2 text-slate-400" />
           Loading trash...
        </div>
 
-       <!-- Schools List -->
-       <div v-else-if="trashTab === 'schools'" class="space-y-4">
-          <div v-if="trashSchools.length === 0" class="text-center py-12 bg-slate-50 rounded-xl border border-dashed border-slate-200">
-             <p class="text-slate-500">No deleted schools found.</p>
-          </div>
-          <div v-for="s in trashSchools" :key="s.id" class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between group">
-             <div>
-                <h3 class="font-semibold text-slate-800">{{ s.name }}</h3>
-                <p class="text-sm text-slate-500">{{ s.address }}</p>
-                <p class="text-xs text-slate-400 mt-1">Deleted: {{ new Date(s.deletedAt).toLocaleDateString() }}</p>
-             </div>
-             <div class="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                <button @click="restoreItem('school', s.id)" class="p-2 text-emerald-600 hover:bg-emerald-50 rounded-lg flex items-center gap-1 text-sm font-medium transition-colors">
-                   <RotateCcw :size="16" /> Restore
-                </button>
-                <button @click="deleteForever('school', s.id)" class="p-2 text-red-600 hover:bg-red-50 rounded-lg flex items-center gap-1 text-sm font-medium transition-colors">
-                   <Trash2 :size="16" /> Delete Forever
-                </button>
-             </div>
-          </div>
-       </div>
-
-       <!-- Permits List -->
+       <!-- Unified List -->
        <div v-else class="space-y-4">
-          <div v-if="trashPermits.length === 0" class="text-center py-12 bg-slate-50 rounded-xl border border-dashed border-slate-200">
-             <p class="text-slate-500">No deleted permits found.</p>
+          <div v-if="unifiedTrash.length === 0" class="text-center py-12 bg-slate-50 rounded-xl border border-dashed border-slate-200">
+             <p class="text-slate-500">Trash bin is empty.</p>
           </div>
-          <div v-for="p in trashPermits" :key="p.id" class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between group">
-             <div>
-                <h3 class="font-semibold text-slate-800">{{ getSchoolName(p.schoolId) }}</h3>
-                <p class="text-sm text-slate-600">Permit No: {{ p.permitNumber }} (SY {{ p.schoolYear }})</p>
-                <p class="text-xs text-slate-400 mt-1">Deleted: {{ new Date(p.deletedAt).toLocaleDateString() }}</p>
+          
+          <div v-for="item in unifiedTrash" :key="item.type + item.id" class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between group hover:border-sky-200 transition-all">
+             <div class="flex items-start gap-4">
+                <div class="mt-1 p-2 rounded-lg" :class="item.type === 'school' ? 'bg-purple-50 text-purple-600' : 'bg-blue-50 text-blue-600'">
+                   <component :is="item.type === 'school' ? Building2 : Shield" :size="20" />
+                </div>
+                <div>
+                   <div class="flex items-center gap-2 mb-1">
+                      <h3 class="font-semibold text-slate-800">{{ item.title }}</h3>
+                      <span class="text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wide" :class="item.badgeColor">
+                         {{ item.type }}
+                      </span>
+                   </div>
+                   <p class="text-sm text-slate-500">{{ item.subtitle }}</p>
+                   <p class="text-xs text-slate-400 mt-1">Deleted: {{ new Date(item.deletedAt).toLocaleDateString() }}</p>
+                </div>
              </div>
+             
              <div class="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                <button @click="restoreItem('permit', p.id)" class="p-2 text-emerald-600 hover:bg-emerald-50 rounded-lg flex items-center gap-1 text-sm font-medium transition-colors">
+                <button @click="restoreItem(item.type, item.id)" class="p-2 text-emerald-600 hover:bg-emerald-50 rounded-lg flex items-center gap-1 text-sm font-medium transition-colors">
                    <RotateCcw :size="16" /> Restore
                 </button>
-                <button @click="deleteForever('permit', p.id)" class="p-2 text-red-600 hover:bg-red-50 rounded-lg flex items-center gap-1 text-sm font-medium transition-colors">
+                <button @click="deleteForever(item.type, item.id)" class="p-2 text-red-600 hover:bg-red-50 rounded-lg flex items-center gap-1 text-sm font-medium transition-colors">
                    <Trash2 :size="16" /> Delete Forever
                 </button>
              </div>
@@ -1856,9 +2356,26 @@ const showEmptyState = computed(() => {
               v-model="schoolForm.address"
               @input="sanitizeAddressInput"
               type="text"
-              placeholder="e.g., 123 Main Street, City, Province"
+              placeholder="e.g. Main Street City Province"
               class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none"
             />
+            
+            <!-- Map Section -->
+            <div class="mt-2 mb-4">
+               <div class="flex items-center justify-between mb-1">
+                  <span class="text-xs text-slate-500">Location Map</span>
+                  <span class="text-xs text-sky-600 font-medium">Click on map to pin exact location</span>
+               </div>
+               <div ref="mapContainer" class="w-full h-64 rounded-lg border border-slate-300 z-0 bg-slate-50 cursor-crosshair"></div>
+               <div v-if="isGeocoding" class="flex items-center gap-2 text-xs text-slate-500 mt-1">
+                  <Loader2 class="w-3 h-3 animate-spin" />
+                  Locating address on map...
+               </div>
+               <div v-if="geocodeError" class="text-xs text-red-500 mt-1 flex items-center gap-1">
+                  <XCircle class="w-3 h-3" />
+                  {{ geocodeError }}
+               </div>
+            </div>
           </div>
 
           <!-- Permit Details (Loop for Multiple Permits) -->
@@ -2107,6 +2624,48 @@ const showEmptyState = computed(() => {
           <div>
             <label class="block text-sm font-medium text-slate-700 mb-1">Address</label>
             <input v-model="editSchoolForm.address" type="text" class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none" />
+          </div>
+          <div class="pt-2">
+            <h4 class="font-semibold text-slate-800 mb-2">Permits</h4>
+            <div v-if="editSchoolPermits.length === 0" class="text-sm text-slate-500">No permits found for this school.</div>
+            <div v-else class="space-y-4 max-h-[40vh] overflow-y-auto">
+              <div 
+                v-for="p in editSchoolPermits" 
+                :key="p.id" 
+                class="rounded-lg border border-slate-200 p-3"
+              >
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label class="block text-xs font-medium text-slate-600 mb-1">Permit Number</label>
+                    <input v-model="p.permitNumber" type="text" class="w-full px-2 py-1.5 rounded border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none text-sm" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-slate-600 mb-1">School Year</label>
+                    <input v-model="p.schoolYear" type="text" class="w-full px-2 py-1.5 rounded border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none text-sm" />
+                  </div>
+                </div>
+                <div class="mt-2">
+                  <label class="block text-xs font-medium text-slate-600 mb-1">Levels</label>
+                  <div class="flex flex-wrap gap-2">
+                    <label 
+                      v-for="opt in levelOptions" 
+                      :key="opt.value"
+                      class="inline-flex items-center gap-2 px-2 py-1 rounded border text-xs cursor-pointer"
+                      :class="p.levels.includes(opt.value) ? 'border-sky-500 bg-sky-50' : 'border-slate-200'"
+                    >
+                      <input 
+                        type="checkbox"
+                        :value="opt.value"
+                        class="rounded text-sky-600 focus:ring-sky-500"
+                        :checked="p.levels.includes(opt.value)"
+                        @change="() => { const i = p.levels.indexOf(opt.value); if (i>=0) p.levels.splice(i,1); else p.levels.push(opt.value); }"
+                      >
+                      <span class="text-slate-700">{{ opt.label }}</span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
         <div class="px-6 py-4 bg-slate-50 flex justify-end gap-3">
