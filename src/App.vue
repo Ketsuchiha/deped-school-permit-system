@@ -1137,22 +1137,22 @@ function extractPermitDetails(text) {
     const found = []
     
     // STEM
-    if (/STEM|Science,? Technology,? Engineering,? (?:and|&) Mathematics|Science\s+and\s+Technology/i.test(txt)) {
+    if (/\bSTEM\b|\bScience,? Technology,? Engineering,? (?:and|&) Mathematics\b|\bScience\s+and\s+Technology\b/i.test(txt)) {
        if (!found.includes('STEM')) found.push('STEM')
     }
     
     // ABM
-    if (/ABM|Accountancy,? Business,? (?:and|&) Management|Business\s+and\s+Management/i.test(txt)) {
+    if (/\bABM\b|\bAccountancy,? Business,? (?:and|&) Management\b|\bBusiness\s+and\s+Management\b/i.test(txt)) {
        if (!found.includes('ABM')) found.push('ABM')
     }
     
     // HUMSS
-    if (/HUMSS|Humanities (?:and|&) Social Sciences|Humanities/i.test(txt)) {
+    if (/\bHUMSS\b|\bHumanities (?:and|&) Social Sciences\b|\bHumanities\b/i.test(txt)) {
        if (!found.includes('HUMSS')) found.push('HUMSS')
     }
     
     // GAS
-    if (/GAS|General Academic/i.test(txt)) {
+    if (/\bGAS\b|\bGeneral Academic\b/i.test(txt)) {
        if (!found.includes('GAS')) found.push('GAS')
     }
     
@@ -1166,18 +1166,18 @@ function extractPermitDetails(text) {
        'Agri-Fishery', 'AFA', 'Agriculture', 'Fishery',
        'Industrial Arts', 'IA', 'Automotive', 'Welding', 'Electrical Installation', 'Electronics', 'Carpentry', 'Plumbing', 'Shielded Metal Arc'
     ]
-    const tvlRegex = new RegExp(tvlKeywords.join('|'), 'i')
+    const tvlRegex = new RegExp(tvlKeywords.map(k => `\\b${k}\\b`).join('|'), 'i')
     if (tvlRegex.test(txt)) {
        if (!found.includes('TVL')) found.push('TVL')
     }
     
     // Sports
-    if (/Sports/i.test(txt)) {
+    if (/\bSports\b/i.test(txt)) {
        if (!found.includes('Sports')) found.push('Sports')
     }
     
     // Arts and Design
-    if (/Arts (?:and|&) Design|Design/i.test(txt)) {
+    if (/\bArts (?:and|&) Design\b|\bDesign\b/i.test(txt)) {
        if (!found.includes('Arts and Design')) found.push('Arts and Design')
     }
     

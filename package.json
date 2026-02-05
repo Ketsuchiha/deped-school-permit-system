@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "backend": "cd backend && node server.js",
+    "start": "concurrently \"npm run backend\" \"npm run dev\"",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -19,6 +21,7 @@
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.2.1",
     "autoprefixer": "^10.4.20",
+    "concurrently": "^9.2.1",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",
     "vite": "^6.0.3"
