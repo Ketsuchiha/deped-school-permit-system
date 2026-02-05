@@ -302,6 +302,50 @@ function initMap() {
   })
   
   tiles.addTo(mapInstance.value)
+
+  // Manual Pinning with Reverse Geocoding
+  mapInstance.value.on('click', async (e) => {
+     const { lat, lng } = e.latlng
+     await handleManualPin(lat, lng)
+  })
+}
+
+async function handleManualPin(lat, lng) {
+  // 1. Update Marker immediately for responsiveness
+  if (mapMarker.value) {
+      mapMarker.value.setLatLng([lat, lng])
+  } else {
+      mapMarker.value = L.marker([lat, lng], { draggable: true }).addTo(mapInstance.value)
+      
+      // Allow dragging the marker to refine position
+      mapMarker.value.on('dragend', async (event) => {
+        const pos = event.target.getLatLng()
+        await handleManualPin(pos.lat, pos.lng)
+      })
+  }
+  
+  // 2. Update Form Coordinates
+  schoolForm.value.latitude = lat
+  schoolForm.value.longitude = lng
+  
+  // 3. Reverse Geocode (Get Address from Pin)
+  isGeocoding.value = true
+  geocodeError.value = ''
+  
+  try {
+     const res = await fetch(`${API_URL}/reverse-geocode?lat=${lat}&lon=${lng}`)
+     const data = await res.json()
+     
+     if (data.status === 'SUCCESS' && data.address) {
+        // Update the address input
+        schoolForm.value.address = data.address
+     }
+  } catch (e) {
+     console.error('Reverse geocode error:', e)
+     // Don't show error to user as this is an enhancement, not a critical failure
+  } finally {
+     isGeocoding.value = false
+  }
 }
 
 async function updateMapFromAddress() {
@@ -326,6 +370,10 @@ async function updateMapFromAddress() {
       }
       
       mapInstance.value.setView([lat, lng], 16)
+      
+      // Sync form with geocoded result
+      schoolForm.value.latitude = lat
+      schoolForm.value.longitude = lng
     } else {
       // Don't remove marker immediately if user is just typing, but maybe warn?
       // Actually requirement says: "If geocoding fails, do not place a marker; Display a clear error"
@@ -333,6 +381,8 @@ async function updateMapFromAddress() {
       if (mapMarker.value) {
         mapInstance.value.removeLayer(mapMarker.value)
         mapMarker.value = null
+        schoolForm.value.latitude = null
+        schoolForm.value.longitude = null
       }
     }
   } catch (e) {
@@ -852,6 +902,8 @@ function setCreateTab(tab) {
   const commonFields = {
     name: '',
     address: '',
+    latitude: null,
+    longitude: null,
     file: null,
     fileName: '',
     filePreviewUrl: null,
@@ -926,6 +978,8 @@ async function createSchool() {
     name: schoolForm.value.name.trim(),
     type: schoolForm.value.type,
     address: (schoolForm.value.address ?? '').trim(),
+    latitude: schoolForm.value.latitude,
+    longitude: schoolForm.value.longitude
   }
 
   try {
@@ -991,12 +1045,23 @@ async function createSchool() {
         name: '', 
         type: createTab.value === 'homeschool' ? 'Homeschooling' : 'Private', 
         address: '', 
+        latitude: null,
+        longitude: null,
         extractedText: '',
         file: null,
         fileName: '',
         filePreviewUrl: null,
         ocrLoading: false,
         permits: [{ permitNumber: '', schoolYear: '', levels: [], strands: [] }]
+      }
+      
+      // Clear map marker
+      if (mapMarker.value) {
+         mapInstance.value?.removeLayer(mapMarker.value)
+         mapMarker.value = null
+      }
+      if (mapInstance.value) {
+         mapInstance.value.setView([14.277, 121.123], 13)
       }
       schoolFormErrors.value = {}
       
@@ -1052,20 +1117,53 @@ function extractPermitDetails(text) {
   // Helper: Detect Strands (Full names & Abbreviations)
   const detectStrands = (txt) => {
     const found = []
+    
     // STEM
-    if (/STEM|Science,? Technology,? Engineering,? (?:and|&) Mathematics/i.test(txt)) found.push('STEM')
+    if (/STEM|Science,? Technology,? Engineering,? (?:and|&) Mathematics|Science\s+and\s+Technology/i.test(txt)) {
+       if (!found.includes('STEM')) found.push('STEM')
+    }
+    
     // ABM
-    if (/ABM|Accountancy,? Business,? (?:and|&) Management/i.test(txt)) found.push('ABM')
+    if (/ABM|Accountancy,? Business,? (?:and|&) Management|Business\s+and\s+Management/i.test(txt)) {
+       if (!found.includes('ABM')) found.push('ABM')
+    }
+    
     // HUMSS
-    if (/HUMSS|Humanities (?:and|&) Social Sciences/i.test(txt)) found.push('HUMSS')
+    if (/HUMSS|Humanities (?:and|&) Social Sciences|Humanities/i.test(txt)) {
+       if (!found.includes('HUMSS')) found.push('HUMSS')
+    }
+    
     // GAS
-    if (/GAS|General Academic/i.test(txt)) found.push('GAS')
-    // TVL
-    if (/TVL|Technical[- ]Vocational[- ]Livelihood/i.test(txt)) found.push('TVL')
+    if (/GAS|General Academic/i.test(txt)) {
+       if (!found.includes('GAS')) found.push('GAS')
+    }
+    
+    // TVL & Specializations
+    // Common TVL Specializations to trigger "TVL" checkbox
+    const tvlKeywords = [
+       'TVL', 
+       'Technical[- ]Vocational[- ]Livelihood',
+       'Tech[- ]Voc',
+       'ICT', 'Information and Communications Technology', 'Computer Systems Servicing', 'Programming', 'Animation',
+       'Home Economics', 'HE', 'Cookery', 'Bread and Pastry', 'Food and Beverage', 'Housekeeping', 'Caregiving', 'Dressmaking', 'Tailoring', 'Wellness Massage',
+       'Agri-Fishery', 'AFA', 'Agriculture', 'Fishery',
+       'Industrial Arts', 'IA', 'Automotive', 'Welding', 'Electrical Installation', 'Electronics', 'Carpentry', 'Plumbing', 'Shielded Metal Arc'
+    ]
+    const tvlRegex = new RegExp(tvlKeywords.join('|'), 'i')
+    if (tvlRegex.test(txt)) {
+       if (!found.includes('TVL')) found.push('TVL')
+    }
+    
     // Sports
-    if (/Sports/i.test(txt)) found.push('Sports')
+    if (/Sports/i.test(txt)) {
+       if (!found.includes('Sports')) found.push('Sports')
+    }
+    
     // Arts and Design
-    if (/Arts (?:and|&) Design/i.test(txt)) found.push('Arts and Design')
+    if (/Arts (?:and|&) Design|Design/i.test(txt)) {
+       if (!found.includes('Arts and Design')) found.push('Arts and Design')
+    }
+    
     return found
   }
   
@@ -1805,9 +1903,9 @@ const showEmptyState = computed(() => {
                               </button>
                             </div>
                           </div>
-                          <div class="flex gap-2">
+                          <div class="flex gap-2 shrink-0">
                             <span 
-                              class="px-2 py-0.5 rounded text-xs font-medium border"
+                              class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
                               :class="{
                                 'bg-purple-50 text-purple-700 border-purple-200': group.schoolType === 'Private',
                                 'bg-blue-50 text-blue-700 border-blue-200': group.schoolType === 'Public',
@@ -1817,7 +1915,7 @@ const showEmptyState = computed(() => {
                               {{ group.schoolType }}
                             </span>
                             <span 
-                              class="px-2 py-0.5 rounded text-xs font-medium border"
+                              class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
                               :class="{
                                 'bg-emerald-50 text-emerald-700 border-emerald-200': getOverallSchoolStatus(group.permits).color === 'green',
                                 'bg-amber-50 text-amber-700 border-amber-200': getOverallSchoolStatus(group.permits).color === 'yellow',
@@ -1921,9 +2019,9 @@ const showEmptyState = computed(() => {
                         </button>
                       </div>
                     </div>
-                    <div class="flex gap-2">
+                    <div class="flex gap-2 shrink-0">
                       <span 
-                        class="px-2 py-0.5 rounded text-xs font-medium border"
+                        class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
                         :class="{
                           'bg-purple-50 text-purple-700 border-purple-200': group.schoolType === 'Private',
                           'bg-blue-50 text-blue-700 border-blue-200': group.schoolType === 'Public',
@@ -1933,7 +2031,7 @@ const showEmptyState = computed(() => {
                         {{ group.schoolType }}
                       </span>
                       <span 
-                        class="px-2 py-0.5 rounded text-xs font-medium border"
+                        class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
                         :class="{
                           'bg-emerald-50 text-emerald-700 border-emerald-200': getOverallSchoolStatus(group.permits).color === 'green',
                           'bg-amber-50 text-amber-700 border-amber-200': getOverallSchoolStatus(group.permits).color === 'yellow',
@@ -2190,7 +2288,11 @@ const showEmptyState = computed(() => {
             
             <!-- Map Section -->
             <div class="mt-2 mb-4">
-               <div ref="mapContainer" class="w-full h-64 rounded-lg border border-slate-300 z-0 bg-slate-50"></div>
+               <div class="flex items-center justify-between mb-1">
+                  <span class="text-xs text-slate-500">Location Map</span>
+                  <span class="text-xs text-sky-600 font-medium">Click on map to pin exact location</span>
+               </div>
+               <div ref="mapContainer" class="w-full h-64 rounded-lg border border-slate-300 z-0 bg-slate-50 cursor-crosshair"></div>
                <div v-if="isGeocoding" class="flex items-center gap-2 text-xs text-slate-500 mt-1">
                   <Loader2 class="w-3 h-3 animate-spin" />
                   Locating address on map...

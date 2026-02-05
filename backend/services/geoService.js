@@ -90,6 +90,45 @@ class GeoService {
   }
 
   /**
+   * Reverse Geocode: Get address from coordinates
+   */
+  async reverseLookup(lat, lon) {
+    try {
+      if (!lat || !lon) return { error: 'Coordinates required' };
+
+      const url = `https://photon.komoot.io/reverse?lat=${lat}&lon=${lon}`;
+      const result = await this._performFetch(url);
+
+      if (result && result.features && result.features.length > 0) {
+        const props = result.features[0].properties;
+        
+        // Construct a readable address
+        const parts = [
+          props.name,
+          props.housenumber,
+          props.street,
+          props.district,
+          props.city,
+          props.state,
+          props.postcode,
+          props.country
+        ].filter(p => p); // Remove undefined/null
+
+        return {
+          status: 'SUCCESS',
+          address: parts.join(', '),
+          details: props
+        };
+      }
+      
+      return { status: 'NO_MATCH' };
+    } catch (e) {
+      console.error('Reverse Lookup Error:', e);
+      return { status: 'ERROR', message: e.message };
+    }
+  }
+
+  /**
    * Validates and sanitizes input.
    */
   validateInput(schoolName, address) {
@@ -112,44 +151,30 @@ class GeoService {
   }
 
   /**
-   * Perform lookup using Photon API.
+   * Helper: Perform HTTP Request
    */
+  _performFetch(url) {
+    return new Promise((resolve, reject) => {
+      https.get(url, { headers: { 'User-Agent': this.USER_AGENT } }, (res) => {
+        if (res.statusCode !== 200) {
+          return reject(new Error(`API Error: ${res.statusCode}`));
+        }
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+            try {
+                resolve(JSON.parse(data));
+            } catch (e) {
+                reject(e);
+            }
+        });
+      }).on('error', reject);
+    });
+  }
+
   async _performLookup(query) {
     const url = `${this.API_ENDPOINT}?q=${encodeURIComponent(query)}&limit=1`;
-    console.log(`[GeoService] Photon Query: ${url}`);
-    
-    return new Promise((resolve, reject) => {
-      const https = require('https');
-      const options = {
-        headers: {
-          'User-Agent': this.USER_AGENT
-        }
-      };
-
-      const req = https.get(url, options, (res) => {
-        if (res.statusCode !== 200) {
-          res.resume();
-          return reject(new Error(`Photon API Error: ${res.statusCode}`));
-        }
-
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => {
-          try {
-            const json = JSON.parse(data);
-            resolve(json);
-          } catch (e) {
-            reject(new Error('Invalid JSON response'));
-          }
-        });
-      });
-
-      req.on('error', (err) => {
-        reject(new Error(`Network Error: ${err.message}`));
-      });
-
-      req.end();
-    });
+    return this._performFetch(url);
   }
 
   // Helper: Standardized Error Response

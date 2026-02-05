@@ -118,26 +118,34 @@ app.get('/api/schools', (req, res) => {
 
 // Create a school
 app.post('/api/schools', async (req, res) => {
-  const { id, name, type, address } = req.body;
+  const { id, name, type, address, latitude, longitude } = req.body;
   
   let lat = null, lng = null, acc = null, status = 'PENDING';
 
-  try {
-    const GeoService = require('./services/geoService');
-    const geoService = new GeoService();
-    const geoResult = await geoService.resolveLocation(name, address);
+  // If manual coordinates provided, use them
+  if (latitude && longitude) {
+     lat = latitude;
+     lng = longitude;
+     acc = 'MANUAL';
+     status = 'MANUAL_PIN';
+  } else {
+    try {
+      const GeoService = require('./services/geoService');
+      const geoService = new GeoService();
+      const geoResult = await geoService.resolveLocation(name, address);
 
-    if (geoResult.status === 'SUCCESS') {
-      lat = geoResult.latitude;
-      lng = geoResult.longitude;
-      acc = geoResult.accuracy;
-      status = 'VERIFIED';
-    } else {
-      status = geoResult.status;
+      if (geoResult.status === 'SUCCESS') {
+        lat = geoResult.latitude;
+        lng = geoResult.longitude;
+        acc = geoResult.accuracy;
+        status = 'VERIFIED';
+      } else {
+        status = geoResult.status;
+      }
+    } catch (e) {
+      console.error("GeoService Error:", e);
+      status = 'SYSTEM_ERROR';
     }
-  } catch (e) {
-    console.error("GeoService Error:", e);
-    status = 'SYSTEM_ERROR';
   }
 
   const sql = `INSERT INTO schools (id, name, type, address, latitude, longitude, geo_accuracy, geo_status, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`;
@@ -294,6 +302,25 @@ app.get('/api/geocode', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Geocoding error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reverse Geocode (Lat/Lon -> Address)
+app.get('/api/reverse-geocode', async (req, res) => {
+  const { lat, lon } = req.query;
+  
+  if (!lat || !lon) {
+    return res.status(400).json({ error: 'Latitude and Longitude required' });
+  }
+
+  try {
+    const GeoService = require('./services/geoService');
+    const geoService = new GeoService();
+    const result = await geoService.reverseLookup(lat, lon);
+    res.json(result);
+  } catch (error) {
+    console.error('Reverse Geocoding error:', error);
     res.status(500).json({ error: error.message });
   }
 });
