@@ -1948,7 +1948,7 @@ const showEmptyState = computed(() => {
                       v-for="group in defaultGroups"
                       :key="group.schoolId"
                       class="group bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden relative z-10 cursor-pointer transition-all hover:border-sky-300"
-                      :class="selectedSchoolId === group.schoolId ? 'ring-2 ring-sky-500 border-transparent' : ''"
+                      :class="selectedSchool?.schoolId === group.schoolId ? 'ring-2 ring-sky-500 border-transparent' : ''"
                       @click="selectSchool(group.schoolId)"
                     >
                       <div class="p-5">
@@ -2068,7 +2068,7 @@ const showEmptyState = computed(() => {
                 v-for="group in searchResults" 
                 :key="group.schoolId"
                 class="group bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden relative z-10 cursor-pointer transition-all hover:border-sky-300"
-                :class="selectedSchoolId === group.schoolId ? 'ring-2 ring-sky-500 border-transparent' : ''"
+                :class="selectedSchool?.schoolId === group.schoolId ? 'ring-2 ring-sky-500 border-transparent' : ''"
                 @click="selectSchool(group.schoolId)"
               >
                 <!-- Search Result Card Content (Identical to previous) -->
