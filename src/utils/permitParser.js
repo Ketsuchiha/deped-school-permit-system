@@ -3,6 +3,11 @@
 export function cleanOCRText(text) {
   if (!text) return ''
   return text
+    .replace(/SCH00L/gi, 'SCHOOL')
+    .replace(/ACAD3MY/gi, 'ACADEMY')
+    .replace(/EDUC4TI0N/gi, 'EDUCATION')
+    .replace(/REPVBLIC/gi, 'REPUBLIC')
+    .replace(/D3PARTMENT/gi, 'DEPARTMENT')
     .replace(/\|/g, 'I') // Pipe to I
     .replace(/\[/g, 'L') // Bracket to L
     .replace(/\]/g, 'J') // Bracket to J
@@ -17,43 +22,106 @@ export function cleanOCRText(text) {
     .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '')
 }
 
+/**
+ * Calculates a confidence score (0-100) based on extracted fields.
+ * If essential fields are missing, confidence drops.
+ */
+export function calculateConfidence(info) {
+  let score = 100
+  const errors = []
+  
+  if (!info.schoolName) {
+    score -= 40
+    errors.push('MISSING_SCHOOL_NAME')
+  } else {
+    if (info.schoolName.length < 5) {
+      score -= 20
+      errors.push('SCHOOL_NAME_TOO_SHORT')
+    }
+    if (/^(operate|establish|maintain|support|conduct|manage)\b/i.test(info.schoolName)) {
+      score -= 50
+      errors.push('POSSIBLE_INVALID_NAME')
+    }
+    // Boost score if it contains valid school keywords
+    if (/(SCHOOL|ACADEMY|INSTITUTE|COLLEGE|UNIVERSITY|MONTESSORI|LEARNING|CENTER)/i.test(info.schoolName)) {
+        score += 5
+    }
+  }
+  
+  if (!info.address) {
+    score -= 30
+    errors.push('MISSING_ADDRESS')
+  } else if (info.address.length < 10) {
+    score -= 10
+    errors.push('ADDRESS_LIKELY_INCOMPLETE')
+  }
+
+  return { score: Math.max(0, score), errors }
+}
+
 export function extractSchoolInfoFromText(text) {
-  if (!text) return { schoolName: '', address: '' }
+  if (!text) return { schoolName: '', address: '', confidence: 0, errors: ['NO_TEXT_EXTRACTED'] }
 
   const cleanText = cleanOCRText(text)
-  // console.log('Clean Text:', cleanText)
-  let name = ''
-  let address = ''
+  
+  // ─── Smart Context Detection ───
+  // Prioritize "Government Permit" or "Government Recognition" sections over Indorsements
+  let textToAnalyze = cleanText
+  const permitHeaderMatch = cleanText.match(/(?:GOVERNMENT\s+(?:RECOGNITION|PERMIT)|AUTHORITY\s+TO\s+OPERATE)/i)
+  if (permitHeaderMatch) {
+     textToAnalyze = cleanText.substring(permitHeaderMatch.index)
+  }
 
-  // 1. Name Strategy: Explicit "To: <Name>" (common in permits)
-  // Look for "To:" followed by capitalized text, stopping at "School" or newlines
-  // Fixed: Handle "Granted to" not at start of line, but restrict "To" to start of line to avoid "Pursuant to"
-  const toMatch = cleanText.match(/(?:(?:^|\n)\s*To|(?:^|\n).*?(?:Granted\s+to|Issued\s+to))[:\s]*\n*([A-Z0-9\s.,&'()-]+?)(?:\n+\(School\)|\s+located\s+at|\s+to\s+operate|\s+for\s+the|\n|$)/i)
-  if (toMatch && toMatch[1]) {
-    const candidate = toMatch[1].trim()
-    if (!candidate.includes('Regional Director') && candidate.length > 3) {
-      name = candidate
-      // console.log('Strategy 1 matched:', name)
+  // Block signatures (Clean text)
+  const signatureMarkers = [
+    /Approved\s+by:/i,
+    /Signed\s+by:/i,
+    /Recommending\s+Approval:/i,
+    /By\s+Authority\s+of\s+the\s+Secretary:/i,
+    /Schools\s+Division\s+Superintendent/i,
+    /Regional\s+Director/i,
+    /Digitally\s+signed/i
+  ]
+
+  let cleanTextForName = textToAnalyze
+  for (const marker of signatureMarkers) {
+    const match = cleanTextForName.match(marker)
+    if (match) {
+       cleanTextForName = cleanTextForName.substring(0, match.index).trim()
+       break 
     }
   }
 
-  // 2. Name Strategy: "The <Name> located/situated at"
+  let name = ''
+  let address = ''
+
+  // 1. Name Strategy: "The <Name> located/situated at" (Most reliable)
+  const theMatch = cleanTextForName.match(/(?:^|\n)\s*(?:The|That)\s+([A-Z0-9\s.,&'()-]+?)\s+(?:located|situated|locat[e3]d|situat[e3]d)\s+(?:at|in)/i)
+  if (theMatch && theMatch[1]) {
+    name = theMatch[1].trim()
+  }
+
+  // 2. Name Strategy: Explicit "To: <Name>"
   if (!name) {
-    const theMatch = cleanText.match(/(?:^|\n)\s*The\s+([A-Z0-9\s.,&'()-]+?)\s+(?:located|situated)\s+(?:at|in)/i)
-    if (theMatch && theMatch[1]) {
-      name = theMatch[1].trim()
-      // console.log('Strategy 2 matched:', name)
+    const toMatch = cleanTextForName.match(/(?:(?:^|\n)\s*To|(?:^|\n).*?(?:Granted\s+to|Issued\s+to))[:\s]*\n*([A-Z0-9\s.,&'()-]+?)(?:\n+\(School\)|\s+located\s+at|\s+to\s+operate|\s+for\s+the|\n|$)/i)
+    if (toMatch && toMatch[1]) {
+      const candidate = toMatch[1].trim()
+      // Filter out false positives like "operate", "establish"
+      if (!candidate.includes('Regional Director') && 
+          candidate.length > 3 &&
+          !/^(operate|establish|maintain|support|conduct|manage)\b/i.test(candidate)) {
+        name = candidate
+      }
     }
   }
 
   // 3. Name Strategy: Explicit Labels "(School)"
   if (!name) {
-    const lines = cleanText.split('\n').map(l => l.trim())
+    const lines = cleanTextForName.split('\n').map(l => l.trim())
     for (let i = 0; i < lines.length; i++) {
       if (/\(School\)/i.test(lines[i]) || /\(Name of School\)/i.test(lines[i])) {
         if (i > 0 && lines[i-1].length > 3 && !/^To$/i.test(lines[i-1])) {
           name = lines[i-1]
-          // console.log('Strategy 3 matched:', name)
           break
         }
       }
@@ -62,19 +130,26 @@ export function extractSchoolInfoFromText(text) {
 
   // 4. Name Strategy: Fallback - Look for lines that look like headers (ALL CAPS) near top
   if (!name) {
-    const lines = cleanText.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+    const lines = cleanTextForName.split('\n').map(l => l.trim()).filter(l => l.length > 0)
     // Skip common headers
-    const skipWords = ['REPUBLIC', 'DEPARTMENT', 'EDUCATION', 'REGION', 'DIVISION', 'GOVERNMENT', 'PERMIT', 'RECOGNITION', 'SECRETARY', 'OFFICE']
-    
-    for (let i = 0; i < Math.min(lines.length, 15); i++) {
+    const skipWords = ['REPUBLIC', 'DEPARTMENT', 'EDUCATION', 'REGION', 'DIVISION', 'GOVERNMENT', 'PERMIT', 'RECOGNITION', 'SECRETARY', 'OFFICE', 'NOTICE']
+    // Valid School Suffixes/Keywords to boost confidence
+    const schoolKeywords = ['SCHOOL', 'ACADEMY', 'INSTITUTE', 'COLLEGE', 'UNIVERSITY', 'MONTESSORI', 'LEARNING', 'CENTER', 'KINDER', 'PRESCHOOL']
+
+    for (let i = 0; i < Math.min(lines.length, 20); i++) {
       const line = lines[i]
       const isUpper = line === line.toUpperCase() && /[A-Z]/.test(line)
       const hasSkip = skipWords.some(w => line.includes(w))
+      const hasSchoolKeyword = schoolKeywords.some(w => line.includes(w))
       
       if (isUpper && !hasSkip && line.length > 5) {
-        name = line
-        // console.log('Strategy 4 matched:', name)
-        break
+        // If it contains a school keyword, it's very likely the name
+        if (hasSchoolKeyword) {
+          name = line
+          break
+        }
+        // Otherwise, keep it as a candidate if we haven't found one yet
+        if (!name) name = line
       }
     }
   }
@@ -88,23 +163,27 @@ export function extractSchoolInfoFromText(text) {
   }
 
   // Address Strategy: "located at", "situated at", "address:"
-  const addressMatch = cleanText.match(/(?:located|situated)\s+(?:at|in)\s*[:;]?\s*([^\n]+)/i)
+  const addressMatch = cleanTextForName.match(/(?:located|situated|locat[e3]d|situat[e3]d)\s+(?:at|in)\s*[:;]?\s*([\s\S]+?)(?=\s+(?:approving|approves|granting|granted|hereby|which|where|to\s+operate|subject\s+to|pursuant|under|following|through|is\s+hereby|\(School\)|\.|,?\s*and\s*|;)|$)/i)
   if (addressMatch && addressMatch[1]) {
     address = addressMatch[1].trim()
   } else {
     // Look for lines containing "City" or "Province" or ending in ZipCode
-    const addrLine = cleanText.match(/(?:^|\n)\s*(?:Address|Location)\s*[:.]?\s*([^\n]+)/i)
+    const addrLine = cleanTextForName.match(/(?:^|\n)\s*(?:Address|Location)\s*[:.]?\s*([^\n]+)/i)
     if (addrLine && addrLine[1]) {
       address = addrLine[1].trim()
     }
   }
 
-  // Cleanup address trailing words (e.g. "is", "has")
+  // Cleanup address
   if (address) {
+    // Remove common trailing phrases and everything after them
+    address = address.replace(/(?:\n|^)\s*(?:for\s+the|effective|subject\s+to|granted\s+to|issued\s+to)[\s\S]*$/i, '')
     address = address.replace(/,?\s+(is|was|has|and)$/i, '').replace(/[.,;:]+$/, '')
   }
 
-  return { schoolName: name, address }
+  const { score, errors } = calculateConfidence({ schoolName: name, address })
+
+  return { schoolName: name, address, confidence: score, errors }
 }
 
 function detectStrands(txt) {
@@ -119,6 +198,11 @@ function detectStrands(txt) {
   return found
 }
 
+function findSchoolYearInContext(context) {
+  const match = context.match(/(?:SY|S\.Y\.|School\s+Year)[\s:.]*(\d{4}[-–]\d{4})/i)
+  return match ? match[1] : null
+}
+
 export function extractPermitDetails(text) {
   if (!text) return []
 
@@ -126,13 +210,21 @@ export function extractPermitDetails(text) {
   const permits = []
 
   // Strategy 1: Standard GP pattern
-  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4}[-–]?\d{0,4})/gi
+  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number|#)?[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4}[-–]?\d{0,4})/gi
   
   let match
   while ((match = gpRegex.exec(t)) !== null) {
     const pNum = match[1].trim()
-    const sYear = match[2].trim()
+    let sYear = match[2].trim()
     if (pNum.length > 25) continue
+
+    const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
+
+    // Refine School Year if it's just a single year (e.g. "s. 2024")
+    if (sYear.length === 4) {
+      const betterYear = findSchoolYearInContext(context)
+      if (betterYear) sYear = betterYear
+    }
 
     const levels = []
     if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
@@ -141,40 +233,45 @@ export function extractPermitDetails(text) {
     else if (/^SHS[-]/i.test(pNum)) levels.push('Senior High School')
 
     if (levels.length === 0) {
-       const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
-       if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
-       if (/Elementary/i.test(context)) levels.push('Elementary')
-       if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
-       if (/Senior\s*High/i.test(context)) levels.push('Senior High School')
+       if (/(?:Kindergarten|Pre[- ]?Elementary|Preschool)/i.test(context)) levels.push('Kindergarten')
+       if (/(?:Elementary|Grades\s+1[-–]6|Primary)/i.test(context)) levels.push('Elementary')
+       if (/(?:Junior\s+High|JHS|Grades\s+7[-–]10)/i.test(context)) levels.push('Junior High School')
+       if (/(?:Senior\s+High|SHS|Grades\s+11[-–]12)/i.test(context)) levels.push('Senior High School')
     }
 
     permits.push({
       permitNumber: pNum,
       schoolYear: sYear,
       levels: [...new Set(levels)],
-      strands: levels.includes('Senior High School') ? detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000)) : []
+      strands: levels.includes('Senior High School') ? detectStrands(context) : []
     })
   }
 
   // Strategy 2: Government Recognition Pattern
-  const grRegex = /Government\s+Recognition(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+)?[\s,.]*(?:s\.?|series\s+of)\s*(\d{4}[-–]?\d{0,4})/gi
+  const grRegex = /Government\s+Recognition(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number|#)?[\s:.]*([A-Z0-9\s-]+)?[\s,.]*(?:s\.?|series\s+of)\s*(\d{4}[-–]?\d{0,4})/gi
   while ((match = grRegex.exec(t)) !== null) {
       const pNum = match[1] ? match[1].trim() : 'Gov. Rec.'
       if (pNum.length > 25) continue
-      const sYear = match[2]
+      let sYear = match[2]
       
-      const levels = []
       const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
-      if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
-      if (/Elementary/i.test(context)) levels.push('Elementary')
-      if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
-      if (/Senior\s*High/i.test(context)) levels.push('Senior High School')
+      
+      if (sYear.length === 4) {
+        const betterYear = findSchoolYearInContext(context)
+        if (betterYear) sYear = betterYear
+      }
+
+      const levels = []
+      if (/(?:Kindergarten|Pre[- ]?Elementary|Preschool)/i.test(context)) levels.push('Kindergarten')
+      if (/(?:Elementary|Grades\s+1[-–]6|Primary)/i.test(context)) levels.push('Elementary')
+      if (/(?:Junior\s+High|JHS|Grades\s+7[-–]10)/i.test(context)) levels.push('Junior High School')
+      if (/(?:Senior\s+High|SHS|Grades\s+11[-–]12)/i.test(context)) levels.push('Senior High School')
 
       permits.push({
           permitNumber: pNum,
           schoolYear: sYear,
           levels: [...new Set(levels)],
-          strands: levels.includes('Senior High School') ? detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000)) : []
+          strands: levels.includes('Senior High School') ? detectStrands(context) : []
       })
   }
 
@@ -184,7 +281,14 @@ export function extractPermitDetails(text) {
     let prefix = match[1].toUpperCase()
     if (prefix === 'S' && match[2].length <= 3) prefix = 'SHS'
     const pNum = `${prefix}-${match[2]}`
-    const sYear = match[3]
+    let sYear = match[3]
+
+    if (sYear.length === 4) {
+        // Look ahead for SY
+        const context = t.substring(match.index, match.index + 100)
+        const betterYear = findSchoolYearInContext(context)
+        if (betterYear) sYear = betterYear
+    }
     
     if (permits.some(p => p.permitNumber === pNum && p.schoolYear === sYear)) continue
     
@@ -197,15 +301,31 @@ export function extractPermitDetails(text) {
     })
   }
 
-  // Deduplicate
+  // Deduplicate and Merge
   const uniquePermits = []
-  const seen = new Set()
+  const permitMap = new Map()
+
   permits.forEach(p => {
-      const key = `${p.permitNumber}-${p.schoolYear}`
-      if (!seen.has(key)) {
-          seen.add(key)
-          uniquePermits.push(p)
+    // Normalize Permit Number for key (remove spacing differences)
+    const key = p.permitNumber.replace(/\s+/g, '').toUpperCase()
+    
+    if (permitMap.has(key)) {
+      const existing = permitMap.get(key)
+      // Merge logic: prefer longer school year (e.g. 2024-2025 over 2024)
+      if (p.schoolYear.length > existing.schoolYear.length) {
+        existing.schoolYear = p.schoolYear
       }
+      // Merge levels
+      const mergedLevels = new Set([...existing.levels, ...p.levels])
+      existing.levels = Array.from(mergedLevels)
+      
+      // Merge strands
+      const mergedStrands = new Set([...existing.strands, ...p.strands])
+      existing.strands = Array.from(mergedStrands)
+    } else {
+      permitMap.set(key, p)
+      uniquePermits.push(p)
+    }
   })
 
   return uniquePermits

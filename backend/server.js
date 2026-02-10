@@ -132,6 +132,17 @@ function logAudit(action, details) {
   });
 }
 
+// ─── Monitoring / Logging ──────────────────────────────────────
+app.post('/api/logs/ocr', (req, res) => {
+  const { errorCode, confidence, fileName, details } = req.body;
+  console.log(`[OCR_MONITOR] Error: ${errorCode} | Conf: ${confidence} | File: ${fileName} | Details: ${details}`);
+  
+  // Optionally store in a separate logs table or file
+  logAudit('OCR_FAILURE', { errorCode, confidence, fileName, details });
+  
+  res.json({ status: 'logged' });
+});
+
 // Mock Email Transporter (For demonstration - use real credentials in production)
 const transporter = nodemailer.createTransport({
   host: 'smtp.ethereal.email',
@@ -468,24 +479,26 @@ app.get('/api/geocode', async (req, res) => {
 });
 
 // Tile Proxy to bypass client-side blocking
-// Renamed to 'maps/proxy' to avoid 'tile' keyword blocking
+// Using CartoDB Voyager to avoid OSM strict blocking/policies for this demo
 app.get('/api/maps/proxy/:z/:x/:y', (req, res) => {
   const { z, x, y } = req.params;
   const https = require('https');
-  const tileUrl = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+  // CartoDB subdomains
+  const subdomain = ['a', 'b', 'c', 'd'][Math.floor(Math.random() * 4)];
+  const tileUrl = `https://${subdomain}.basemaps.cartocdn.com/rastertiles/voyager/${z}/${x}/${y}.png`;
   
-  console.log(`[Proxy] Fetching: ${z}/${x}/${y}`);
+  // console.log(`[Proxy] Fetching: ${z}/${x}/${y} from ${subdomain}`);
 
   const options = {
     headers: {
-      'User-Agent': 'DepEdPermitSystem/1.0 (Education Project)',
+      'User-Agent': 'SchoolPermitSystem/1.0 (Student Project)',
       'Accept': 'image/png,image/*;q=0.8',
     }
   };
   
   const proxyReq = https.get(tileUrl, options, (proxyRes) => {
     if (proxyRes.statusCode !== 200) {
-      console.error(`[Proxy] Upstream Error: ${proxyRes.statusCode}`);
+      // console.error(`[Proxy] Upstream Error: ${proxyRes.statusCode}`);
       proxyRes.resume();
       return res.status(proxyRes.statusCode).send('Upstream error');
     }
@@ -502,8 +515,8 @@ app.get('/api/maps/proxy/:z/:x/:y', (req, res) => {
     if (!res.headersSent) res.status(502).send('Proxy network error');
   });
   
-  proxyReq.setTimeout(15000, () => {
-    console.error(`[Proxy] Timeout: ${z}/${x}/${y}`);
+  // Timeout 10s
+  proxyReq.setTimeout(10000, () => {
     proxyReq.destroy();
   });
 });

@@ -1,10 +1,11 @@
 <script setup>
 import { ref, computed, watch, onMounted, nextTick } from 'vue'
-import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2, RotateCcw, Eye, Download, MapPin } from 'lucide-vue-next'
+import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2, RotateCcw, RotateCw, Eye, Download, MapPin, History, MapPinOff, AlertTriangle } from 'lucide-vue-next'
 import Tesseract from 'tesseract.js'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import CustomSelect from './components/CustomSelect.vue'
+import { extractPermitDetails, extractSchoolInfoFromText, calculateConfidence } from './utils/permitParser.js'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 
@@ -164,6 +165,135 @@ async function saveEditSchool() {
   }
 }
 
+// ─── Edit School Map Logic ──────────────────────────────────────────────────
+const mapContainerEdit = ref(null)
+const isGeocodingEdit = ref(false)
+let mapInstanceEdit = null
+let markerInstanceEdit = null
+let debounceTimerEdit = null
+
+function debounceGeocodeEdit() {
+  if (debounceTimerEdit) clearTimeout(debounceTimerEdit)
+  debounceTimerEdit = setTimeout(() => {
+    geocodeEditAddress()
+  }, 1000)
+}
+
+async function geocodeEditAddress() {
+  const addr = editSchoolForm.value.address
+  if (!addr || !addr.trim()) return
+
+  isGeocodingEdit.value = true
+  try {
+    const res = await fetch(`${API_URL}/geocode?q=${encodeURIComponent(addr)}`)
+    if (res.ok) {
+      const data = await res.json()
+      if (data && data.features && data.features.length > 0) {
+        const [lng, lat] = data.features[0].geometry.coordinates
+        // Just update map, don't reverse geocode back
+        updateEditMapLocation(lat, lng, false) 
+      } else {
+        showToast('Location not found', 'error')
+      }
+    }
+  } catch (err) {
+    console.error('Geocoding failed:', err)
+  } finally {
+    isGeocodingEdit.value = false
+  }
+}
+
+async function reverseGeocodeEdit(lat, lng) {
+  isGeocodingEdit.value = true
+  try {
+     const res = await fetch(`${API_URL}/reverse-geocode?lat=${lat}&lon=${lng}`)
+     const data = await res.json()
+     if (data.status === 'SUCCESS' && data.address) {
+        editSchoolForm.value.address = data.address
+     }
+  } catch (e) {
+     console.error('Reverse geocode error:', e)
+  } finally {
+     isGeocodingEdit.value = false
+  }
+}
+
+function updateEditMapLocation(lat, lng, triggerReverse = true) {
+  editSchoolForm.value.latitude = lat
+  editSchoolForm.value.longitude = lng
+  
+  if (mapInstanceEdit) {
+    mapInstanceEdit.setView([lat, lng], 16)
+    
+    if (markerInstanceEdit) markerInstanceEdit.remove()
+    markerInstanceEdit = L.marker([lat, lng], { draggable: true }).addTo(mapInstanceEdit)
+    
+    markerInstanceEdit.on('dragend', async (e) => {
+      const { lat, lng } = e.target.getLatLng()
+      editSchoolForm.value.latitude = lat
+      editSchoolForm.value.longitude = lng
+      await reverseGeocodeEdit(lat, lng)
+    })
+  }
+
+  if (triggerReverse) {
+     reverseGeocodeEdit(lat, lng)
+  }
+}
+
+async function initEditMap() {
+  await nextTick()
+  if (!mapContainerEdit.value) return
+  
+  // Clean up existing map
+  if (mapInstanceEdit) {
+    mapInstanceEdit.remove()
+    mapInstanceEdit = null
+  }
+
+  // Default coordinates (Cabuyao or existing)
+  const lat = editSchoolForm.value.latitude || 14.277
+  const lng = editSchoolForm.value.longitude || 121.123
+  const zoom = editSchoolForm.value.latitude ? 16 : 13
+
+  mapInstanceEdit = L.map(mapContainerEdit.value).setView([lat, lng], zoom)
+  
+  L.tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(mapInstanceEdit)
+
+  // Add marker if coordinates exist
+  if (editSchoolForm.value.latitude && editSchoolForm.value.longitude) {
+    markerInstanceEdit = L.marker([lat, lng], { draggable: true }).addTo(mapInstanceEdit)
+    
+    markerInstanceEdit.on('dragend', async (e) => {
+      const { lat, lng } = e.target.getLatLng()
+      editSchoolForm.value.latitude = lat
+      editSchoolForm.value.longitude = lng
+      await reverseGeocodeEdit(lat, lng)
+    })
+  }
+
+  // Map click to set location
+  mapInstanceEdit.on('click', (e) => {
+    const { lat, lng } = e.latlng
+    // Trigger reverse geocode on click
+    updateEditMapLocation(lat, lng, true)
+  })
+}
+
+watch(isEditingSchool, (val) => {
+  if (val) {
+    initEditMap()
+  } else {
+    if (mapInstanceEdit) {
+      mapInstanceEdit.remove()
+      mapInstanceEdit = null
+    }
+  }
+})
+
 // Permit CRUD
 function openEditPermit(permit) {
   editPermitForm.value = { 
@@ -248,6 +378,8 @@ const schoolForm = ref({
   file: null, // For OCR upload
   filePreviewUrl: null,
   ocrLoading: false,
+  ocrConfidence: 100,
+  ocrErrors: [],
   // Combined Flow Fields
   levels: [],
   schoolYear: '',
@@ -476,43 +608,75 @@ const mapContainerView = ref(null)
 let mapInstanceView = null
 let markerInstanceView = null
 
-// Watch selected school to update map
+// New Map for Details Modal
+const mapContainerDetails = ref(null)
+let mapInstanceDetails = null
+let markerInstanceDetails = null
+
+// Watch selected school to update maps
 watch(selectedSchool, async (school) => {
   if (!school) {
      if (mapInstanceView) {
         mapInstanceView.remove()
         mapInstanceView = null
      }
+     if (mapInstanceDetails) {
+        mapInstanceDetails.remove()
+        mapInstanceDetails = null
+     }
      return
   }
   
   await nextTick()
-  if (!mapContainerView.value) return
-
-  const lat = school.latitude
-  const lng = school.longitude
   
-  if (lat && lng) {
-     if (!mapInstanceView) {
-        mapInstanceView = L.map(mapContainerView.value).setView([lat, lng], 15)
-        L.tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, {
-           maxZoom: 19,
-           attribution: '© OpenStreetMap'
-        }).addTo(mapInstanceView)
-     } else {
-        mapInstanceView.setView([lat, lng], 15)
-        mapInstanceView.invalidateSize()
-     }
-     
-     if (markerInstanceView) markerInstanceView.remove()
-     markerInstanceView = L.marker([lat, lng], { draggable: false }).addTo(mapInstanceView)
-  } else {
-     // If no coordinates, maybe show a "No map data" state or default view
-     if (mapInstanceView) {
-        mapInstanceView.setView([14.5995, 120.9842], 10) // Default to Manila
-        mapInstanceView.invalidateSize()
-     }
-     if (markerInstanceView) markerInstanceView.remove()
+  // 1. Update Main View Map (Sticky)
+  if (mapContainerView.value) {
+      const lat = school.latitude
+      const lng = school.longitude
+      
+      if (lat && lng) {
+         if (!mapInstanceView) {
+            mapInstanceView = L.map(mapContainerView.value).setView([lat, lng], 15)
+            L.tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, {
+               maxZoom: 19,
+               attribution: '© OpenStreetMap'
+            }).addTo(mapInstanceView)
+         } else {
+            mapInstanceView.setView([lat, lng], 15)
+            mapInstanceView.invalidateSize()
+         }
+         
+         if (markerInstanceView) markerInstanceView.remove()
+         markerInstanceView = L.marker([lat, lng], { draggable: false }).addTo(mapInstanceView)
+      }
+  }
+
+  // 2. Update Details Modal Map
+  if (mapContainerDetails.value) {
+      const lat = school.latitude
+      const lng = school.longitude
+      
+      if (lat && lng) {
+         if (!mapInstanceDetails) {
+            mapInstanceDetails = L.map(mapContainerDetails.value).setView([lat, lng], 16)
+            L.tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, {
+               maxZoom: 19,
+               attribution: '© OpenStreetMap'
+            }).addTo(mapInstanceDetails)
+         } else {
+            mapInstanceDetails.setView([lat, lng], 16)
+            mapInstanceDetails.invalidateSize()
+         }
+         
+         if (markerInstanceDetails) markerInstanceDetails.remove()
+         markerInstanceDetails = L.marker([lat, lng], { draggable: false }).addTo(mapInstanceDetails)
+      } else {
+         // Default view if no coords
+         if (!mapInstanceDetails) {
+             mapInstanceDetails = L.map(mapContainerDetails.value).setView([14.278, 121.122], 13)
+             L.tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, { maxZoom: 19 }).addTo(mapInstanceDetails)
+         }
+      }
   }
 })
 
@@ -520,7 +684,79 @@ function selectSchool(id) {
   const group = searchResults.value.find(g => g.schoolId === id)
   if (group) {
     selectedSchool.value = group
+    // isMapModalOpen.value = true // Disable separate map modal to show combined view
+    showDetailsModal.value = false
   }
+}
+
+// ─── Map Modal Logic ─────────────────────────────────────────────────────────
+const isMapModalOpen = ref(false)
+const showDetailsModal = ref(false)
+const mapModalContainer = ref(null)
+let mapModalInstance = null
+
+function closeMapModal() {
+  isMapModalOpen.value = false
+  if (mapModalInstance) {
+    mapModalInstance.remove()
+    mapModalInstance = null
+  }
+}
+
+function openDetailsFromMap() {
+  isMapModalOpen.value = false
+  showDetailsModal.value = true
+}
+
+watch(isMapModalOpen, async (isOpen) => {
+  if (isOpen && selectedSchool.value) {
+    await nextTick()
+    initModalMap()
+  }
+})
+
+function initModalMap() {
+  if (!mapModalContainer.value || !selectedSchool.value) return
+  
+  if (mapModalInstance) {
+    mapModalInstance.remove()
+    mapModalInstance = null
+  }
+
+  const school = selectedSchool.value
+  const lat = school.latitude || 14.2471423
+  const lng = school.longitude || 121.1366715
+
+  mapModalInstance = L.map(mapModalContainer.value).setView([lat, lng], 16)
+  
+  L.tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, {
+    maxZoom: 19,
+    attribution: '© OpenStreetMap'
+  }).addTo(mapModalInstance)
+
+  L.marker([lat, lng])
+    .addTo(mapModalInstance)
+    .bindPopup(`
+      <div class="text-center p-2">
+        <h3 class="font-bold text-slate-800 mb-1">${school.schoolName}</h3>
+        <p class="text-xs text-slate-500 mb-2">${school.schoolAddress}</p>
+        <button id="view-details-btn" class="text-xs bg-sky-600 text-white px-3 py-1.5 rounded-lg hover:bg-sky-700 transition-colors w-full">
+          View Details
+        </button>
+      </div>
+    `)
+    .openPopup()
+
+  mapModalInstance.on('popupopen', () => {
+    const btn = document.getElementById('view-details-btn')
+    if (btn) {
+      btn.onclick = (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        openDetailsFromMap()
+      }
+    }
+  })
 }
 
 // ─── Level options for Upload Permit ─────────────────────────────────────────
@@ -647,10 +883,136 @@ async function deleteForever(type, id) {
 
 const createTab = ref('school') // 'school' | 'homeschool'
 
-async function onSchoolFileChange(e) {
-  const file = e.target.files?.[0]
-  if (!file) return
+// ─── Image Preprocessing Helpers ───
+function applyImageEnhancement(ctx, width, height) {
+  // 1. Get image data
+  const imageData = ctx.getImageData(0, 0, width, height)
+  const data = imageData.data
   
+  // 2. Grayscale & Contrast
+  const contrast = 1.5 // 50% increase
+  const intercept = 128 * (1 - contrast)
+  
+  // Create a copy for noise reduction (reading from original/processed, writing to buffer)
+  // We'll apply grayscale/contrast first in place, then do noise reduction
+  for (let i = 0; i < data.length; i += 4) {
+    const gray = data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114
+    let newGray = gray * contrast + intercept
+    newGray = Math.max(0, Math.min(255, newGray))
+    
+    data[i] = newGray
+    data[i+1] = newGray
+    data[i+2] = newGray
+  }
+
+  // 3. Noise Reduction (Median Filter 3x3) - Helps remove salt-and-pepper noise
+  // We need a copy of the data to read neighbors from
+  const originalData = new Uint8ClampedArray(data)
+  
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const idx = (y * width + x) * 4
+      
+      // Collect 3x3 window
+      const window = []
+      for (let ky = -1; ky <= 1; ky++) {
+        for (let kx = -1; kx <= 1; kx++) {
+          const nIdx = ((y + ky) * width + (x + kx)) * 4
+          window.push(originalData[nIdx]) // Only need R channel since it's grayscale
+        }
+      }
+      
+      // Sort and pick median
+      window.sort((a, b) => a - b)
+      const median = window[4]
+      
+      data[idx] = median
+      data[idx+1] = median
+      data[idx+2] = median
+      // Alpha remains unchanged
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+}
+
+async function preprocessImage(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => {
+      const canvas = document.createElement('canvas')
+      const ctx = canvas.getContext('2d')
+      canvas.width = img.width
+      canvas.height = img.height
+      ctx.drawImage(img, 0, 0)
+      
+      applyImageEnhancement(ctx, canvas.width, canvas.height)
+      
+      canvas.toBlob((blob) => resolve(blob), file.type)
+    }
+    img.onerror = reject
+    img.src = URL.createObjectURL(file)
+  })
+}
+
+async function rotateBlob(blob, angle) {
+  const img = new Image()
+  const url = URL.createObjectURL(blob)
+  img.src = url
+  await new Promise(r => img.onload = r)
+  URL.revokeObjectURL(url)
+  
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d')
+  
+  // Swap dimensions for 90/270 degrees
+  if (Math.abs(angle) % 180 === 90) {
+    canvas.width = img.height
+    canvas.height = img.width
+  } else {
+    canvas.width = img.width
+    canvas.height = img.height
+  }
+  
+  ctx.translate(canvas.width / 2, canvas.height / 2)
+  ctx.rotate(angle * Math.PI / 180)
+  ctx.drawImage(img, -img.width / 2, -img.height / 2)
+  
+  return new Promise(resolve => canvas.toBlob(resolve, blob.type))
+}
+
+async function rotateImage(direction) {
+  if (!schoolForm.value.file || !schoolForm.value.file.type.startsWith('image/')) return
+  
+  try {
+    const blob = await rotateBlob(schoolForm.value.file, direction)
+    const newFile = new File([blob], schoolForm.value.fileName, { type: schoolForm.value.file.type })
+    processSchoolFile(newFile)
+  } catch (err) {
+    console.error('Rotation failed:', err)
+  }
+}
+
+async function detectOrientation(imageBlob) {
+  try {
+    // Use OSD mode (psm: 0) to detect orientation
+    const { data } = await Tesseract.recognize(imageBlob, 'osd', {
+      logger: m => {} 
+    })
+    
+    // Tesseract OSD returns orientation_degrees (angle to rotate to be upright)
+    // and confidence.
+    if (data.confidence > 80 && data.orientation_degrees !== 0) {
+       return data.orientation_degrees
+    }
+    return 0
+  } catch (e) {
+    console.warn('OSD failed, skipping auto-rotation', e)
+    return 0
+  }
+}
+
+async function processSchoolFile(file) {
   if (schoolForm.value.filePreviewUrl) URL.revokeObjectURL(schoolForm.value.filePreviewUrl)
   schoolForm.value.file = file
   schoolForm.value.filePreviewUrl = URL.createObjectURL(file)
@@ -660,20 +1022,35 @@ async function onSchoolFileChange(e) {
   try {
     let text = ''
     if (file.type.startsWith('image/')) {
-      const { data } = await Tesseract.recognize(file, 'eng')
+      let processedBlob = await preprocessImage(file)
+      
+      // Auto-Orientation Detection
+      const angle = await detectOrientation(processedBlob)
+      if (angle !== 0) {
+         console.log(`Auto-rotating image by ${angle} degrees`)
+         processedBlob = await rotateBlob(processedBlob, angle)
+         // Update preview with rotated image
+         URL.revokeObjectURL(schoolForm.value.filePreviewUrl)
+         schoolForm.value.filePreviewUrl = URL.createObjectURL(processedBlob)
+         // Update stored file so manual rotation works on the new orientation
+         schoolForm.value.file = new File([processedBlob], file.name, { type: file.type })
+      }
+      
+      const { data } = await Tesseract.recognize(processedBlob, 'eng+fil')
       text = data.text
     } else if (file.type === 'application/pdf') {
        // Robust PDF text extract
        const buf = await file.arrayBuffer()
        const pdf = await getDocument({ data: buf }).promise
        
-       const maxPages = Math.min(pdf.numPages, 10) // Increased to 10 to catch multiple permits
+       const maxPages = Math.min(pdf.numPages, 50) 
        for (let i = 1; i <= maxPages; i++) {
          const page = await pdf.getPage(i)
          const content = await page.getTextContent()
          let pageText = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
          
-         // If text is too sparse, try OCR on the page (scanned PDF)
+         pageText = ` --- PAGE ${i} --- \n ${pageText} \n`
+         
          if (pageText.replace(/\s/g, '').length < 50) {
             try {
               const viewport = page.getViewport({ scale: 2.0 })
@@ -682,8 +1059,11 @@ async function onSchoolFileChange(e) {
               canvas.height = viewport.height
               canvas.width = viewport.width
               await page.render({ canvasContext: context, viewport: viewport }).promise
+              
+              applyImageEnhancement(context, viewport.width, viewport.height)
+              
               const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))
-              const { data } = await Tesseract.recognize(blob, 'eng')
+              const { data } = await Tesseract.recognize(blob, 'eng+fil')
               pageText = data.text
             } catch (ocrErr) {
               console.error('Page OCR failed:', ocrErr)
@@ -695,167 +1075,33 @@ async function onSchoolFileChange(e) {
     
     schoolForm.value.extractedText = text
 
-    // ─── Smart Context Detection ───
-    // Prioritize "Government Permit" or "Government Recognition" sections over Indorsements
-    let textToAnalyze = text
-    const permitHeaderMatch = text.match(/(?:GOVERNMENT\s+(?:RECOGNITION|PERMIT)|AUTHORITY\s+TO\s+OPERATE)/i)
+    // ─── Centralized Extraction ───
+    const { schoolName, address, confidence, errors } = extractSchoolInfoFromText(text)
+    schoolForm.value.ocrConfidence = confidence !== undefined ? confidence : 100
+    schoolForm.value.ocrErrors = errors || []
     
-    if (permitHeaderMatch) {
-       textToAnalyze = text.substring(permitHeaderMatch.index)
+    // Log OCR Health
+    if (confidence < 70 || (errors && errors.length > 0)) {
+       fetch(`${API_URL}/logs/ocr`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+             errorCode: errors.join(', ') || 'LOW_CONFIDENCE',
+             confidence,
+             fileName: file.name,
+             details: `Name: ${schoolName}, Addr: ${address}`
+          })
+       }).catch(e => console.error('Failed to log OCR health', e))
     }
 
-    // Block signatures (Clean text)
-    const signatureMarkers = [
-      /Approved\s+by:/i,
-      /Signed\s+by:/i,
-      /Recommending\s+Approval:/i,
-      /By\s+Authority\s+of\s+the\s+Secretary:/i,
-      /Schools\s+Division\s+Superintendent/i,
-      /Regional\s+Director/i,
-      /Digitally\s+signed/i
-    ]
-
-    let cleanTextForName = textToAnalyze
-    for (const marker of signatureMarkers) {
-      const match = cleanTextForName.match(marker)
-      if (match) {
-         cleanTextForName = cleanTextForName.substring(0, match.index).trim()
-         break 
-      }
-    }
-
-    // Extract School Name & Address
-    const lines = cleanTextForName.split('\n').map(l => l.trim()).filter(l => l)
-    
-    // Find School Name
-    const schoolKeywords = ['School', 'Academy', 'College', 'Institute', 'University', 'Montessori', 'Learning Center', 'Lyceum']
-    let foundName = ''
-    
-    // Strategy 1: "To [Name]" Pattern (Strongest)
-    // Matches "To \n SCHOLA ANGELICUS \n (School)" or just "To: SCHOLA..."
-    const toMatch = cleanTextForName.match(/(?:^|\n)(?:To|Issued\s+to|Granted\s+to)[:\s]*\n*([A-Z0-9\s.,&'-]+?)(?:\n+\(School\)|\s+located\s+at|\s+to\s+operate|\s+for\s+the|\n|$)/i)
-    if (toMatch && toMatch[1]) {
-        const candidate = toMatch[1].trim()
-        if (!candidate.includes('Regional Director') && candidate.length > 3) {
-           foundName = candidate
-        }
-    }
-    
-    // Strategy 2: "The [Name] located at" Pattern
-    if (!foundName) {
-       const theMatch = cleanTextForName.match(/The\s+([A-Z0-9\s.,&'-]+?)\s+located\s+at/i)
-       if (theMatch && theMatch[1]) foundName = theMatch[1].trim()
-    }
-
-    // Strategy 3: Explicit Labels "(School)" or "(Name of School)"
-    if (!foundName) {
-       for (let i = 0; i < lines.length; i++) {
-          const line = lines[i].trim()
-          // Look for line containing exactly "(School)"
-          if (/\(School\)/i.test(line) || /\(Name of School\)/i.test(line)) {
-             // The name should be on the previous line (i-1)
-             if (i > 0) {
-                const prevLine = lines[i-1].trim()
-                if (prevLine && !/^To$/i.test(prevLine) && prevLine.length > 3) {
-                   foundName = prevLine
-                   break
-                }
-             }
-          }
-       }
-    }
-
-    if (!foundName) {
-      // Fallback: Scan lines for keywords, excluding headers/sentences
-      for (const line of lines) {
-         if (line.match(/^(Respectfully|This\s+permit|Pursuant|Republic|Department|Region|Division|Office|Subject|To:|From:)/i)) continue
-         if (line.length > 80 || line.includes('...')) continue
-         
-         if (schoolKeywords.some(k => line.includes(k))) {
-            foundName = line
-            break
-         }
-      }
-    }
-    
-    if (foundName) {
-      // Cleanup
-      const prefixMatch = foundName.match(/(?:Administrator|Principal|Head|Director)\s+of\s+(?:the\s+)?(.*)/i)
-      if (prefixMatch && prefixMatch[1]) foundName = prefixMatch[1].trim()
-      foundName = foundName.replace(/^Respectfully\s+endorsed\s+to\s+/i, '')
-      foundName = foundName.replace(/[,.]+$/, '')
-    }
-    
-    // Find Address
-    let foundAddress = ''
-    
-    // Strategy 1: "located at [Address]" (Strongest)
-    const locatedMatch = cleanTextForName.match(/located\s+at\s+([A-Z0-9\s.,&'-]+?)(?:\s+(?:approving|approves|granting|granted|hereby|which|where|to\s+operate|subject\s+to|pursuant|under|following|through|is\s+hereby|\(School\))|$)/i)
-    if (locatedMatch && locatedMatch[1]) {
-       foundAddress = locatedMatch[1].trim().replace(/[.,;:]+$/, '')
-    }
-    
-    // Strategy 2: Explicit Labels "(Complete Address)" or "(Address)"
-    if (!foundAddress) {
-       for (let i = 0; i < lines.length; i++) {
-          const line = lines[i].trim()
-          if (/\(Complete Address\)/i.test(line) || /\(Address\)/i.test(line)) {
-             if (i > 0) {
-                const prevLine = lines[i-1].trim()
-                if (prevLine && prevLine !== foundName) {
-                   foundAddress = prevLine
-                   break
-                }
-             }
-          }
-       }
-    }
-
-    // Strategy 3: Scan for City/Province
-    if (!foundAddress) {
-      const addressBlockList = /^(Department|Republic|Region|Division|Office|District|Subject|To:|From:|The)/i
-      // Explicitly ignore DepEd Regional Office Header Address
-      const depEdHeaderRegex = /Karangalan\s+Village|Cainta,? \s*Rizal|Region\s+IV-A/i
-
-      for (const line of lines) {
-        if (line.includes(foundName)) continue
-        if (addressBlockList.test(line)) continue
-        if (depEdHeaderRegex.test(line)) continue // Skip DepEd Header Address
-        
-        const hasCity = /\bCity\b/.test(line) && !/City\s+Schools\s+Division/i.test(line)
-        const hasProvince = /\bProvince\b/.test(line) && !/Province\s+of/i.test(line)
-        const hasStreet = /\b(St\.|Street|Ave|Avenue|Rd|Road|Brgy|Barangay|Subd|Subdivision|Village)\b/i.test(line)
-        
-        if (hasCity || hasProvince || hasStreet) {
-           let cleaned = line.replace(/^(located at|address[:.]?)\s*/i, '')
-           cleaned = cleaned.replace(/[.,;:]+$/, '')
-           // Stop at common delimiters to avoid grabbing subsequent sentence parts
-           const stopWords = [' through ', ' subject to ', ' pursuant ', ' under ', ' following ', ' is hereby ']
-           for (const word of stopWords) {
-             const idx = cleaned.toLowerCase().indexOf(word)
-             if (idx !== -1) {
-               cleaned = cleaned.substring(0, idx)
-               break
-             }
-           }
-           if (cleaned.split(' ').length > 2) {
-              foundAddress = cleaned
-              break
-           }
-        }
-      }
-    }
-    
-    if (foundName) schoolForm.value.name = foundName
-    if (foundAddress) {
-       // Apply strict sanitization to OCR address result
-       schoolForm.value.address = sanitizeAddressString(foundAddress)
+    if (schoolName) schoolForm.value.name = schoolName
+    if (address) {
+       schoolForm.value.address = sanitizeAddressString(address)
     }
 
     // Fallback: Use Filename as School Name if still empty and filename looks like a name
     if (!schoolForm.value.name && file.name) {
        const nameFromExt = file.name.replace(/\.(pdf|jpg|jpeg|png)$/i, '')
-       // If it doesn't look like a generic permit name
        if (!/permit|recognition|gov|deped/i.test(nameFromExt) && nameFromExt.length > 5) {
           schoolForm.value.name = nameFromExt
        }
@@ -869,13 +1115,10 @@ async function onSchoolFileChange(e) {
          schoolYear: p.schoolYear,
          levels: p.levels,
          strands: p.strands || [],
-         // We don't attach specific file object here as it's one upload for now,
-         // but backend might want to link the same file to multiple permits.
       }))
       
       showToast(`Detected ${extractedPermits.length} permit(s). Auto-filled details.`, 'success')
     } else {
-      // If no permits detected, at least initialize one empty row if none exist
       if (schoolForm.value.permits.length === 0) {
          schoolForm.value.permits.push({
             permitNumber: '',
@@ -895,6 +1138,18 @@ async function onSchoolFileChange(e) {
   } finally {
     schoolForm.value.ocrLoading = false
   }
+}
+
+function verifyScan() {
+  schoolForm.value.ocrConfidence = 100
+  schoolForm.value.ocrErrors = []
+  showToast('Marked as verified', 'success')
+}
+
+async function onSchoolFileChange(e) {
+  const file = e.target.files?.[0]
+  if (!file) return
+  processSchoolFile(file)
 }
 
 function setCreateTab(tab) {
@@ -1109,7 +1364,7 @@ function showToast(message, type = 'success') {
 }
 
 /** Extract multiple permit details from OCR text */
-function extractPermitDetails(text) {
+function extractPermitDetails_UNUSED(text) {
   if (!text || typeof text !== 'string' || !text.trim()) return []
   
   // 1. Pre-process: Normalize whitespace and fix common OCR typos in keywords
@@ -1316,7 +1571,8 @@ async function onPermitFileChange(e) {
     let fullText = ''
     
     if (file.type.startsWith('image/')) {
-      const { data } = await Tesseract.recognize(file, 'eng')
+      const processedBlob = await preprocessImage(file)
+      const { data } = await Tesseract.recognize(processedBlob, 'eng')
       fullText = data.text
       extractedPermits = extractPermitDetails(fullText)
     } else if (file.type === 'application/pdf') {
@@ -1337,6 +1593,9 @@ async function onPermitFileChange(e) {
              canvas.height = viewport.height
              canvas.width = viewport.width
              await page.render({ canvasContext: context, viewport: viewport }).promise
+             
+             applyImageEnhancement(context, viewport.width, viewport.height)
+             
              const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))
              const { data } = await Tesseract.recognize(blob, 'eng')
              pageText = data.text
@@ -1592,11 +1851,12 @@ function getStatus(schoolYear) {
   }
   
   // Logic:
-  // 1. Operating: Until Dec 31 of the End Year
+  // 1. Operating: Until July 31 of the End Year (Approx. End of School Year)
   // 2. For Renewal: For 1 year after expiration
   // 3. Closed: If not renewed after 1 year (expiration + 1 year)
   
-  const expirationDate = new Date(endYear, 11, 31) // Dec 31 of End Year
+  // Use July 31 as the standard end of School Year (adjusted for PH shift)
+  const expirationDate = new Date(endYear, 6, 31) 
   const now = new Date()
   
   // Reset hours for accurate day calc
@@ -1819,11 +2079,11 @@ const showEmptyState = computed(() => {
           <button
             type="button"
             @click="currentView = 'registration'"
-            class="inline-flex items-center gap-2 text-sm font-medium transition-colors"
-            :class="currentView === 'registration' ? 'text-sky-600' : 'text-slate-500 hover:text-slate-700'"
+            class="inline-flex items-center gap-2 text-sm font-medium transition-colors hover:text-sky-600"
+            :class="currentView === 'registration' ? 'text-sky-600' : 'text-slate-500'"
           >
             <Plus :size="18" />
-            Registration
+            Create School
           </button>
         </nav>
       </div>
@@ -2267,97 +2527,139 @@ const showEmptyState = computed(() => {
        </div>
     </main>
 
-    <!-- ─── Registration View ───────────────────────────────────────────── -->
-    <main v-else-if="currentView === 'registration'" class="max-w-4xl mx-auto px-4 py-8">
+    <!-- ─── Create School View ───────────────────────────────────────────── -->
+    <main v-else-if="currentView === 'registration'" class="max-w-7xl mx-auto px-4 py-8">
       <div class="flex items-center gap-3 mb-6">
          <div class="p-2 bg-sky-100 text-sky-600 rounded-lg">
             <Plus :size="24" />
          </div>
          <div>
-            <h2 class="text-2xl font-bold text-slate-800">Registration</h2>
+            <h2 class="text-2xl font-bold text-slate-800">Create School</h2>
             <p class="text-slate-600">Register new schools or homeschooling providers</p>
          </div>
       </div>
 
-      <!-- Registration Form Card -->
-      <section class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 mb-6">
-        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
-          <h3 class="text-lg font-semibold text-slate-800">New Application</h3>
-          
-          <!-- Tabs -->
-          <div class="flex bg-slate-100 p-1 rounded-lg self-start sm:self-auto">
-            <button
-              type="button"
-              @click="setCreateTab('school')"
-              class="px-4 py-1.5 text-sm font-medium rounded-md transition-all"
-              :class="createTab === 'school' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'"
-            >
-              School
-            </button>
-            <button
-              type="button"
-              @click="setCreateTab('homeschool')"
-              class="px-4 py-1.5 text-sm font-medium rounded-md transition-all"
-              :class="createTab === 'homeschool' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'"
-            >
-              Homeschooling
-            </button>
-          </div>
-        </div>
-
-        <form @submit.prevent="createSchool" class="space-y-4">
-          
-          <!-- Upload Scan for Details (Common) -->
-          <div class="mb-4 p-4 bg-slate-50 rounded-lg border border-dashed border-slate-300">
-            <label class="block text-sm font-medium text-slate-700 mb-2">
-               Auto-fill details from Document (Optional)
-            </label>
-            <div class="flex items-center gap-4">
-               <input 
-                 type="file" 
-                 accept=".pdf,image/*" 
-                 @change="onSchoolFileChange"
-                 class="block w-full text-sm text-slate-500
-                    file:mr-4 file:py-2 file:px-4
-                    file:rounded-full file:border-0
-                    file:text-sm file:font-semibold
-                    file:bg-sky-50 file:text-sky-700
-                    hover:file:bg-sky-100"
-               />
-               <div v-if="schoolForm.ocrLoading" class="flex items-center text-sky-600 text-sm">
-                 <Loader2 class="w-4 h-4 mr-2 animate-spin" />
-                 Scanning...
-               </div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+        <!-- Left Column: Form -->
+        <section class="bg-white rounded-xl border border-slate-200 shadow-sm p-6">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+            <h3 class="text-lg font-semibold text-slate-800">New Application</h3>
+            
+            <!-- Tabs -->
+            <div class="flex bg-slate-100 p-1 rounded-lg self-start sm:self-auto">
+              <button
+                type="button"
+                @click="setCreateTab('school')"
+                class="px-4 py-1.5 text-sm font-medium rounded-md transition-all"
+                :class="createTab === 'school' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'"
+              >
+                School
+              </button>
+              <button
+                type="button"
+                @click="setCreateTab('homeschool')"
+                class="px-4 py-1.5 text-sm font-medium rounded-md transition-all"
+                :class="createTab === 'homeschool' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'"
+              >
+                Homeschooling
+              </button>
             </div>
-            <p class="text-xs text-slate-500 mt-2">Upload a permit or registration document to auto-detect details.</p>
           </div>
+
+          <form @submit.prevent="createSchool" class="space-y-4">
+            
+            <!-- Upload Scan for Details (Common) -->
+            <div class="mb-4 p-4 bg-slate-50 rounded-lg border border-dashed border-slate-300">
+              <label class="block text-sm font-medium text-slate-700 mb-2">
+                 Auto-fill details from Document (Optional)
+              </label>
+              <div class="flex items-center gap-4">
+                 <input 
+                   type="file" 
+                   accept=".pdf,image/*" 
+                   @change="onSchoolFileChange"
+                   class="block w-full text-sm text-slate-500
+                      file:mr-4 file:py-2 file:px-4
+                      file:rounded-full file:border-0
+                      file:text-sm file:font-semibold
+                      file:bg-sky-50 file:text-sky-700
+                      hover:file:bg-sky-100"
+                 />
+                 <div v-if="schoolForm.ocrLoading" class="flex items-center text-sky-600 text-sm">
+                   <Loader2 class="w-4 h-4 mr-2 animate-spin" />
+                   Scanning...
+                 </div>
+              </div>
+              <p class="text-xs text-slate-500 mt-2">Upload a permit or registration document to auto-detect details.</p>
+
+              <!-- OCR Confidence Alert -->
+              <div v-if="schoolForm.extractedText" class="mt-3 pt-3 border-t border-slate-200">
+                 <div v-if="schoolForm.ocrConfidence < 70" class="p-3 bg-amber-50 border border-amber-200 rounded-lg flex items-start gap-2">
+                    <div class="p-1 bg-amber-100 rounded text-amber-600 shrink-0">
+                       <AlertTriangle :size="16" />
+                    </div>
+                    <div>
+                       <h4 class="text-sm font-semibold text-amber-800">Low Confidence Scan ({{ schoolForm.ocrConfidence }}%)</h4>
+                       <p class="text-xs text-amber-700 mt-0.5">Some details might be inaccurate. Please review the highlighted fields carefully.</p>
+                       <ul v-if="schoolForm.ocrErrors && schoolForm.ocrErrors.length" class="mt-2 list-disc list-inside text-xs text-amber-700 capitalize">
+                          <li v-for="err in schoolForm.ocrErrors" :key="err">{{ err.replace(/_/g, ' ').toLowerCase() }}</li>
+                       </ul>
+                       <button type="button" @click="verifyScan" class="mt-2 text-xs font-semibold bg-amber-200 text-amber-800 px-2 py-1 rounded hover:bg-amber-300 transition-colors">
+                          Mark as Verified
+                       </button>
+                    </div>
+                 </div>
+                 <div v-else class="flex items-center gap-2 text-sm text-emerald-600 font-medium">
+                    <CheckCircle :size="16" />
+                    <span>High Confidence Scan ({{ schoolForm.ocrConfidence }}%)</span>
+                 </div>
+              </div>
+            </div>
 
           <!-- Name Field (Dynamic Label) -->
           <div>
-            <label for="schoolName" class="block text-sm font-medium text-slate-700 mb-1">
-              {{ createTab === 'school' ? 'School Name' : 'Homeschooling Provider Name' }} <span class="text-red-500">*</span>
-            </label>
+            <div class="flex items-center justify-between mb-1">
+              <label for="schoolName" class="block text-sm font-medium text-slate-700">
+                {{ createTab === 'school' ? 'School Name' : 'Homeschooling Provider Name' }} <span class="text-red-500">*</span>
+              </label>
+              <span v-if="schoolForm.ocrErrors?.includes('MISSING_SCHOOL_NAME') || schoolForm.ocrErrors?.includes('SCHOOL_NAME_TOO_SHORT')" class="text-xs font-medium text-amber-600 flex items-center gap-1">
+                 <AlertTriangle :size="12" /> Check Name
+              </span>
+            </div>
             <input
               id="schoolName"
               v-model="schoolForm.name"
               type="text"
               :placeholder="createTab === 'school' ? 'e.g., St. Mary\'s Academy' : 'e.g., Happy Homeschool Center'"
-              class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none"
-              :class="{ 'border-red-500': schoolFormErrors.name }"
+              class="w-full px-3 py-2 rounded-lg border focus:ring-2 outline-none transition-colors"
+              :class="[
+                schoolFormErrors.name ? 'border-red-500 focus:ring-red-200' : 
+                (schoolForm.ocrErrors?.includes('MISSING_SCHOOL_NAME') || schoolForm.ocrErrors?.includes('SCHOOL_NAME_TOO_SHORT')) ? 'border-amber-300 bg-amber-50 focus:border-amber-500 focus:ring-amber-200' : 
+                'border-slate-300 focus:ring-sky-500 focus:border-sky-500'
+              ]"
             />
             <p v-if="schoolFormErrors.name" class="mt-1 text-sm text-red-600">{{ schoolFormErrors.name }}</p>
           </div>
 
           <!-- Common Address Field -->
           <div>
-            <label for="schoolAddress" class="block text-sm font-medium text-slate-700 mb-1">Address</label>
+            <div class="flex items-center justify-between mb-1">
+               <label for="schoolAddress" class="block text-sm font-medium text-slate-700">Address</label>
+               <span v-if="schoolForm.ocrErrors?.includes('MISSING_ADDRESS') || schoolForm.ocrErrors?.includes('ADDRESS_LIKELY_INCOMPLETE')" class="text-xs font-medium text-amber-600 flex items-center gap-1">
+                 <AlertTriangle :size="12" /> Check Address
+              </span>
+            </div>
             <input
               id="schoolAddress"
               v-model="schoolForm.address"
               @input="sanitizeAddressInput"
               type="text"
               placeholder="e.g. Main Street City Province"
-              class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 outline-none"
+              class="w-full px-3 py-2 rounded-lg border focus:ring-2 outline-none transition-colors"
+              :class="[
+                 (schoolForm.ocrErrors?.includes('MISSING_ADDRESS') || schoolForm.ocrErrors?.includes('ADDRESS_LIKELY_INCOMPLETE')) ? 'border-amber-300 bg-amber-50 focus:border-amber-500 focus:ring-amber-200' : 
+                 'border-slate-300 focus:ring-sky-500 focus:border-sky-500'
+              ]"
             />
             
             <!-- Map Section -->
@@ -2512,11 +2814,61 @@ const showEmptyState = computed(() => {
           </button>
         </form>
       </section>
-    </main>
+
+      <!-- Right Column: File Preview -->
+      <div class="hidden lg:block lg:sticky lg:top-6 space-y-6">
+         <div v-if="schoolForm.filePreviewUrl" class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden h-[calc(100vh-120px)] flex flex-col">
+            <div class="px-4 py-3 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+               <h3 class="font-medium text-slate-700 text-sm flex items-center gap-2">
+                  <FileImage :size="16" />
+                  Document Preview
+               </h3>
+               <div class="flex items-center gap-3">
+                  <div v-if="schoolForm.file?.type.startsWith('image/')" class="flex items-center gap-1 border-r border-slate-200 pr-3 mr-3">
+                    <button type="button" @click="rotateImage(-90)" class="p-1 hover:bg-slate-200 rounded text-slate-500 transition-colors" title="Rotate Left">
+                       <RotateCcw :size="14" />
+                    </button>
+                    <button type="button" @click="rotateImage(90)" class="p-1 hover:bg-slate-200 rounded text-slate-500 transition-colors" title="Rotate Right">
+                       <RotateCw :size="14" />
+                    </button>
+                    <!-- Fine Rotation -->
+                     <div class="flex items-center gap-1 ml-2 border-l border-slate-200 pl-2">
+                        <span class="text-[10px] text-slate-400 font-mono">TILT</span>
+                        <button type="button" @click="rotateImage(-0.5)" class="p-1 hover:bg-slate-200 rounded text-slate-500 transition-colors" title="Tilt Left 0.5°">
+                           <Minus :size="10" />
+                        </button>
+                        <button type="button" @click="rotateImage(0.5)" class="p-1 hover:bg-slate-200 rounded text-slate-500 transition-colors" title="Tilt Right 0.5°">
+                           <Plus :size="10" />
+                        </button>
+                     </div>
+                  </div>
+                  <span class="text-xs text-slate-500 truncate max-w-[150px]">{{ schoolForm.fileName }}</span>
+               </div>
+            </div>
+            <div class="flex-1 bg-slate-100 overflow-hidden relative">
+               <iframe 
+                  v-if="schoolForm.fileName?.toLowerCase().endsWith('.pdf')"
+                  :src="schoolForm.filePreviewUrl" 
+                  class="w-full h-full border-0"
+               ></iframe>
+               <div v-else class="w-full h-full overflow-auto flex items-center justify-center p-4">
+                  <img :src="schoolForm.filePreviewUrl" class="max-w-full h-auto shadow-sm rounded border border-slate-200" />
+               </div>
+            </div>
+         </div>
+         
+         <div v-else class="bg-slate-50 rounded-xl border border-dashed border-slate-300 p-8 text-center h-64 flex flex-col items-center justify-center text-slate-400">
+            <FileImage :size="48" class="mb-4 opacity-50" />
+            <p class="text-sm font-medium">No document uploaded</p>
+            <p class="text-xs mt-1">Upload a file to see preview here</p>
+         </div>
+      </div>
+    </div> <!-- End Grid -->
+  </main>
 
     <div
       v-if="previewPermit"
-      class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 px-4"
+      class="fixed inset-0 bg-black/60 flex items-center justify-center z-[70] px-4"
     >
       <div class="bg-white rounded-xl shadow-xl max-w-3xl w-full max-h-[90vh] flex flex-col">
         <div class="flex items-center justify-between px-4 py-3 border-b border-slate-200">
@@ -2593,93 +2945,175 @@ const showEmptyState = computed(() => {
     </Transition>
     <!-- ─── Modals ──────────────────────────────────────────────────────── -->
     
+    <!-- Map Modal -->
+    <div v-if="isMapModalOpen" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+      <div class="bg-white rounded-xl shadow-xl w-full max-w-4xl h-[80vh] overflow-hidden animate-in zoom-in-95 duration-200 flex flex-col relative">
+        <div class="absolute top-4 right-4 z-[1000] flex gap-2">
+           <button @click="openDetailsFromMap" class="bg-white/90 backdrop-blur text-slate-700 px-3 py-1.5 rounded-lg shadow-md text-sm font-medium hover:bg-white hover:text-sky-600 transition-colors flex items-center gap-2">
+              <Building2 :size="16" />
+              View Details
+           </button>
+           <button @click="closeMapModal" class="bg-white/90 backdrop-blur text-slate-700 p-1.5 rounded-lg shadow-md hover:bg-red-50 hover:text-red-600 transition-colors">
+              <XCircle :size="20" />
+           </button>
+        </div>
+        <div ref="mapModalContainer" class="w-full h-full z-0"></div>
+      </div>
+    </div>
+
     <!-- Edit School Modal -->
     <div v-if="isEditingSchool" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
-      <div class="bg-white rounded-xl shadow-xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200">
-        <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center">
-          <h3 class="font-bold text-slate-800">Edit School</h3>
+      <div class="bg-white rounded-xl shadow-xl w-full max-w-5xl overflow-hidden animate-in zoom-in-95 duration-200 flex flex-col max-h-[90vh]">
+        <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 shrink-0">
+          <h3 class="font-bold text-slate-800 text-lg">Edit School</h3>
           <button @click="isEditingSchool = false" class="text-slate-400 hover:text-slate-600">
             <XCircle :size="20" />
           </button>
         </div>
-        <div class="p-6 space-y-4">
-          <div>
-            <label class="block text-sm font-medium text-slate-700 mb-1">School Name</label>
-            <input v-model="editSchoolForm.name" type="text" class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium text-slate-700 mb-1">Type</label>
-            <div class="flex gap-4">
-              <label class="flex items-center gap-2 cursor-pointer">
-                <input type="radio" v-model="editSchoolForm.type" value="Private" class="text-sky-600 focus:ring-sky-500" />
-                <span class="text-sm text-slate-700">Private</span>
-              </label>
-
-              <label class="flex items-center gap-2 cursor-pointer">
-                <input type="radio" v-model="editSchoolForm.type" value="Homeschooling" class="text-sky-600 focus:ring-sky-500" />
-                <span class="text-sm text-slate-700">Homeschooling</span>
-              </label>
-            </div>
-          </div>
-          <div>
-            <label class="block text-sm font-medium text-slate-700 mb-1">Address</label>
-            <input v-model="editSchoolForm.address" type="text" class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none" />
-          </div>
-          <div class="pt-2">
-            <h4 class="font-semibold text-slate-800 mb-2">Permits</h4>
-            <div v-if="editSchoolPermits.length === 0" class="text-sm text-slate-500">No permits found for this school.</div>
-            <div v-else class="space-y-4 max-h-[40vh] overflow-y-auto">
-              <div 
-                v-for="p in editSchoolPermits" 
-                :key="p.id" 
-                class="rounded-lg border border-slate-200 p-3"
-              >
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label class="block text-xs font-medium text-slate-600 mb-1">Permit Number</label>
-                    <input v-model="p.permitNumber" type="text" class="w-full px-2 py-1.5 rounded border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none text-sm" />
-                  </div>
-                  <div>
-                    <label class="block text-xs font-medium text-slate-600 mb-1">School Year</label>
-                    <input v-model="p.schoolYear" type="text" class="w-full px-2 py-1.5 rounded border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none text-sm" />
-                  </div>
+        
+        <div class="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-2">
+          <!-- Left: Form Fields -->
+          <div class="p-6 overflow-y-auto max-h-[70vh]">
+            <div class="space-y-4">
+              <div>
+                <label class="block text-sm font-medium text-slate-700 mb-1">School Name</label>
+                <input v-model="editSchoolForm.name" type="text" class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none" />
+              </div>
+              
+              <div>
+                <label class="block text-sm font-medium text-slate-700 mb-1">Type</label>
+                <div class="flex gap-4">
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input type="radio" v-model="editSchoolForm.type" value="Private" class="text-sky-600 focus:ring-sky-500" />
+                    <span class="text-sm text-slate-700">Private</span>
+                  </label>
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input type="radio" v-model="editSchoolForm.type" value="Homeschooling" class="text-sky-600 focus:ring-sky-500" />
+                    <span class="text-sm text-slate-700">Homeschooling</span>
+                  </label>
                 </div>
-                <div class="mt-2">
-                  <label class="block text-xs font-medium text-slate-600 mb-1">Levels</label>
-                  <div class="flex flex-wrap gap-2">
-                    <label 
-                      v-for="opt in levelOptions" 
-                      :key="opt.value"
-                      class="inline-flex items-center gap-2 px-2 py-1 rounded border text-xs cursor-pointer"
-                      :class="p.levels.includes(opt.value) ? 'border-sky-500 bg-sky-50' : 'border-slate-200'"
-                    >
-                      <input 
-                        type="checkbox"
-                        :value="opt.value"
-                        class="rounded text-sky-600 focus:ring-sky-500"
-                        :checked="p.levels.includes(opt.value)"
-                        @change="() => { const i = p.levels.indexOf(opt.value); if (i>=0) p.levels.splice(i,1); else p.levels.push(opt.value); }"
-                      >
-                      <span class="text-slate-700">{{ opt.label }}</span>
-                    </label>
+              </div>
+
+              <div>
+                <label class="block text-sm font-medium text-slate-700 mb-1">Address</label>
+                <div class="flex gap-2">
+                   <input 
+                      v-model="editSchoolForm.address" 
+                      type="text" 
+                      placeholder="e.g. Brgy. Banay-Banay, Cabuyao City"
+                      class="flex-1 px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none" 
+                      @input="debounceGeocodeEdit"
+                   />
+                   <button 
+                      @click="geocodeEditAddress"
+                      type="button"
+                      class="px-3 py-2 bg-slate-100 text-slate-600 rounded-lg hover:bg-slate-200 border border-slate-200 transition-colors"
+                      title="Locate on map"
+                   >
+                      <MapPin :size="18" />
+                   </button>
+                </div>
+                <p class="text-xs text-slate-500 mt-1">
+                   Typing the address will automatically update the map location. You can also drag the pin on the map.
+                </p>
+              </div>
+
+              <div class="pt-4 border-t border-slate-100">
+                <h4 class="font-semibold text-slate-800 mb-2 flex items-center gap-2">
+                   <History class="w-4 h-4 text-sky-600" />
+                   Permits
+                </h4>
+                <div v-if="editSchoolPermits.length === 0" class="text-sm text-slate-500 italic">No permits found for this school.</div>
+                <div v-else class="space-y-4 max-h-[30vh] overflow-y-auto pr-2">
+                  <div 
+                    v-for="p in editSchoolPermits" 
+                    :key="p.id" 
+                    class="rounded-lg border border-slate-200 p-3 bg-slate-50 hover:bg-white hover:border-sky-200 transition-all"
+                  >
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-2">
+                      <div>
+                        <label class="block text-xs font-medium text-slate-600 mb-1">Permit Number</label>
+                        <input v-model="p.permitNumber" type="text" class="w-full px-2 py-1.5 rounded border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none text-sm bg-white" />
+                      </div>
+                      <div>
+                        <label class="block text-xs font-medium text-slate-600 mb-1">School Year</label>
+                        <input v-model="p.schoolYear" type="text" class="w-full px-2 py-1.5 rounded border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none text-sm bg-white" />
+                      </div>
+                    </div>
+                    <div>
+                      <label class="block text-xs font-medium text-slate-600 mb-1">Levels</label>
+                      <div class="flex flex-wrap gap-2">
+                        <label 
+                          v-for="opt in levelOptions" 
+                          :key="opt.value"
+                          class="inline-flex items-center gap-2 px-2 py-1 rounded border text-xs cursor-pointer bg-white transition-colors"
+                          :class="p.levels.includes(opt.value) ? 'border-sky-500 bg-sky-50 text-sky-700' : 'border-slate-200 text-slate-600'"
+                        >
+                          <input 
+                            type="checkbox"
+                            :value="opt.value"
+                            class="rounded text-sky-600 focus:ring-sky-500"
+                            :checked="p.levels.includes(opt.value)"
+                            @change="() => { const i = p.levels.indexOf(opt.value); if (i>=0) p.levels.splice(i,1); else p.levels.push(opt.value); }"
+                          >
+                          <span>{{ opt.label }}</span>
+                        </label>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
           </div>
+          
+          <!-- Right: Interactive Map -->
+          <div class="relative bg-slate-100 min-h-[600px] border-l border-slate-200 flex flex-col">
+             <div ref="mapContainerEdit" class="absolute inset-0 z-0 cursor-crosshair"></div>
+             
+             <!-- Map Overlay Controls (Top Right) -->
+             <div class="absolute top-4 right-4 z-[400] flex flex-col gap-2">
+                <div class="bg-white/90 backdrop-blur p-2 rounded-lg shadow-md text-xs text-slate-600 max-w-[200px]">
+                   <p class="font-semibold mb-1">Map Instructions</p>
+                   <ul class="list-disc list-inside space-y-1">
+                      <li>Drag marker to refine location</li>
+                      <li>Click anywhere to move marker</li>
+                   </ul>
+                </div>
+             </div>
+
+             <!-- Coordinates Display (Bottom) -->
+             <div class="absolute bottom-4 left-4 right-4 z-[400]">
+                <div class="bg-white/90 backdrop-blur px-3 py-2 rounded-lg shadow-md flex items-center gap-4 text-xs text-slate-600 border border-slate-200">
+                   <div class="flex items-center gap-1">
+                      <span class="font-semibold">Lat:</span>
+                      <span class="font-mono">{{ editSchoolForm.latitude ? parseFloat(editSchoolForm.latitude).toFixed(6) : 'N/A' }}</span>
+                   </div>
+                   <div class="w-px h-3 bg-slate-300"></div>
+                   <div class="flex items-center gap-1">
+                      <span class="font-semibold">Lng:</span>
+                      <span class="font-mono">{{ editSchoolForm.longitude ? parseFloat(editSchoolForm.longitude).toFixed(6) : 'N/A' }}</span>
+                   </div>
+                   <div v-if="isGeocodingEdit" class="ml-auto flex items-center gap-2 text-sky-600">
+                      <Loader2 class="w-3 h-3 animate-spin" />
+                      <span>Locating...</span>
+                   </div>
+                </div>
+             </div>
+          </div>
         </div>
-        <div class="px-6 py-4 bg-slate-50 flex justify-end gap-3">
+
+        <div class="px-6 py-4 bg-slate-50 flex justify-end gap-3 shrink-0 border-t border-slate-100">
           <button @click="isEditingSchool = false" class="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800">Cancel</button>
-          <button @click="saveEditSchool" class="px-4 py-2 text-sm font-medium text-white bg-sky-600 rounded-lg hover:bg-sky-700">Save Changes</button>
+          <button @click="saveEditSchool" class="px-4 py-2 text-sm font-medium text-white bg-sky-600 rounded-lg hover:bg-sky-700 shadow-sm">Save Changes</button>
         </div>
       </div>
     </div>
 
     <!-- School Details Modal -->
     <div v-if="selectedSchool" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
-      <div class="bg-white rounded-xl shadow-xl w-full max-w-2xl overflow-hidden animate-in zoom-in-95 duration-200 flex flex-col max-h-[90vh]">
+      <div class="bg-white rounded-xl shadow-xl w-full max-w-6xl overflow-hidden animate-in zoom-in-95 duration-200 flex flex-col max-h-[90vh]">
         <!-- Header -->
-        <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+        <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 shrink-0">
           <div>
             <h3 class="font-bold text-slate-800 text-lg">{{ selectedSchool.schoolName }}</h3>
             <div class="flex items-center gap-2 mt-1">
@@ -2711,24 +3145,26 @@ const showEmptyState = computed(() => {
           </div>
         </div>
 
-        <!-- Body -->
-        <div class="p-6 overflow-y-auto flex-1">
-          <!-- Address -->
-          <div class="mb-6 flex items-start gap-3">
-            <MapPin class="w-5 h-5 text-slate-400 mt-0.5" />
-            <div>
-              <p class="text-sm font-medium text-slate-700">Address</p>
-              <p class="text-slate-600">{{ selectedSchool.schoolAddress || 'No address provided' }}</p>
+        <!-- Body Grid -->
+        <div class="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-2">
+          <!-- Left: Details -->
+          <div class="p-6 overflow-y-auto max-h-[70vh]">
+            <!-- Address -->
+            <div class="mb-6 flex items-start gap-3">
+              <MapPin class="w-5 h-5 text-slate-400 mt-0.5" />
+              <div>
+                <p class="text-sm font-medium text-slate-700">Address</p>
+                <p class="text-slate-600">{{ selectedSchool.schoolAddress || 'No address provided' }}</p>
+              </div>
             </div>
-          </div>
 
-          <!-- Permit History -->
-          <div class="mb-6">
-            <div class="flex items-center justify-between mb-4">
-              <h4 class="font-semibold text-slate-800 flex items-center gap-2">
-                <History class="w-4 h-4 text-sky-600" />
-                Permit History
-              </h4>
+            <!-- Permit History -->
+            <div class="mb-6">
+              <div class="flex items-center justify-between mb-4">
+                <h4 class="font-semibold text-slate-800 flex items-center gap-2">
+                  <History class="w-4 h-4 text-sky-600" />
+                  Permit History
+                </h4>
               <button 
                 @click="openRenewPermit(selectedSchool.schoolId)" 
                 class="text-sm font-medium text-sky-600 hover:text-sky-700 flex items-center gap-1 hover:bg-sky-50 px-2 py-1 rounded-lg transition-colors"
@@ -2790,6 +3226,18 @@ const showEmptyState = computed(() => {
                 </div>
               </div>
             </div>
+          </div>
+          </div>
+          
+          <!-- Right: Map -->
+          <div class="relative bg-slate-100 min-h-[600px] border-l border-slate-200">
+              <div ref="mapContainerDetails" class="absolute inset-0 z-0"></div>
+              <div v-if="!selectedSchool.latitude || !selectedSchool.longitude" class="absolute inset-0 flex items-center justify-center text-slate-400 bg-slate-50/50">
+                  <div class="text-center">
+                      <MapPinOff :size="32" class="mx-auto mb-2 opacity-50" />
+                      <p class="text-sm">No map coordinates</p>
+                  </div>
+              </div>
           </div>
         </div>
       </div>
