@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2, RotateCcw, RotateCw, Eye, Download, MapPin, History, MapPinOff, AlertTriangle } from 'lucide-vue-next'
 import Tesseract from 'tesseract.js'
-import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
+import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf'
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import CustomSelect from './components/CustomSelect.vue'
 import { extractPermitDetails, extractSchoolInfoFromText, calculateConfidence } from './utils/permitParser.js'
@@ -390,12 +390,11 @@ const schoolForm = ref({
 })
 const schoolFormErrors = ref({})
 
-// Strict Address Input Validation
+// Address Input Sanitization (keep numbers and basic punctuation for accurate geocoding)
 function sanitizeAddressString(input) {
   if (!input) return ''
-  // Allow only letters (A-Z, a-z) and space
-  // No numbers or special characters allowed
-  return input.replace(/[^a-zA-Z\s]/g, '')
+  // Allow letters, numbers, spaces, and common address punctuation
+  return input.replace(/[^a-zA-Z0-9\s.,#\-\/()]/g, '')
 }
 
 function sanitizeAddressInput(e) {
@@ -1040,18 +1039,20 @@ async function processSchoolFile(file) {
       text = data.text
     } else if (file.type === 'application/pdf') {
        // Robust PDF text extract
-       const buf = await file.arrayBuffer()
+      const buf = await file.arrayBuffer()
        const pdf = await getDocument({ data: buf }).promise
        
        const maxPages = Math.min(pdf.numPages, 50) 
        for (let i = 1; i <= maxPages; i++) {
          const page = await pdf.getPage(i)
          const content = await page.getTextContent()
-         let pageText = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
+         const rawText = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
+         let pageText = rawText
          
-         pageText = ` --- PAGE ${i} --- \n ${pageText} \n`
+         const normalized = rawText.replace(/\s/g, '')
+         const hasKey = /GOVERNMENT\s*PERMIT|GOVERNMENT\s*RECOGNITION|AUTHORITY\s*TO\s*OPERATE|DepEd\s*Permit/i.test(rawText)
          
-         if (pageText.replace(/\s/g, '').length < 50) {
+         if (!hasKey || normalized.length < 200) {
             try {
               const viewport = page.getViewport({ scale: 2.0 })
               const canvas = document.createElement('canvas')
@@ -1064,11 +1065,16 @@ async function processSchoolFile(file) {
               
               const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))
               const { data } = await Tesseract.recognize(blob, 'eng+fil')
-              pageText = data.text
+              const ocrText = data.text || ''
+              if (ocrText.replace(/\s/g, '').length > normalized.length) {
+                pageText = ocrText
+              }
             } catch (ocrErr) {
               console.error('Page OCR failed:', ocrErr)
             }
          }
+         
+         pageText = ` --- PAGE ${i} --- \n ${pageText} \n`
          text += pageText + ' '
        }
     }
@@ -1078,7 +1084,7 @@ async function processSchoolFile(file) {
     // ─── Centralized Extraction ───
     const { schoolName, address, confidence, errors } = extractSchoolInfoFromText(text)
     schoolForm.value.ocrConfidence = confidence !== undefined ? confidence : 100
-    schoolForm.value.ocrErrors = errors || []
+    schoolForm.value.ocrErrors = errors ? [...errors] : []
     
     // Log OCR Health
     if (confidence < 70 || (errors && errors.length > 0)) {
@@ -1117,8 +1123,18 @@ async function processSchoolFile(file) {
          strands: p.strands || [],
       }))
       
+      const first = extractedPermits[0]
+      if (!first.permitNumber || !first.schoolYear) {
+        if (!schoolForm.value.ocrErrors.includes('PERMIT_INCOMPLETE')) {
+          schoolForm.value.ocrErrors.push('PERMIT_INCOMPLETE')
+        }
+      }
+      
       showToast(`Detected ${extractedPermits.length} permit(s). Auto-filled details.`, 'success')
     } else {
+      if (!schoolForm.value.ocrErrors.includes('NO_PERMIT_DETECTED')) {
+        schoolForm.value.ocrErrors.push('NO_PERMIT_DETECTED')
+      }
       if (schoolForm.value.permits.length === 0) {
          schoolForm.value.permits.push({
             permitNumber: '',
@@ -1583,9 +1599,13 @@ async function onPermitFileChange(e) {
       for (let i = 1; i <= maxPages; i++) {
         const page = await pdf.getPage(i)
         const content = await page.getTextContent()
-        let pageText = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
+        const rawText = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
+        let pageText = rawText
         
-        if (pageText.replace(/\s/g, '').length < 50) {
+        const normalized = rawText.replace(/\s/g, '')
+        const hasKey = /GOVERNMENT\s*PERMIT|GOVERNMENT\s*RECOGNITION|AUTHORITY\s*TO\s*OPERATE|DepEd\s*Permit/i.test(rawText)
+        
+        if (!hasKey || normalized.length < 200) {
            try {
              const viewport = page.getViewport({ scale: 2.0 })
              const canvas = document.createElement('canvas')
@@ -1598,7 +1618,10 @@ async function onPermitFileChange(e) {
              
              const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))
              const { data } = await Tesseract.recognize(blob, 'eng')
-             pageText = data.text
+             const ocrText = data.text || ''
+             if (ocrText.replace(/\s/g, '').length > normalized.length) {
+               pageText = ocrText
+             }
            } catch (ocrErr) {
              console.error('Page OCR failed:', ocrErr)
            }
@@ -1867,21 +1890,21 @@ function getStatus(schoolYear) {
   const daysPast = Math.floor((now - expirationDate) / msPerDay)
   
   if (daysPast <= 0) {
-    return { label: 'Operating', color: 'green' }
+    return { label: 'Operational', color: 'green' }
   } else if (daysPast <= 365) {
     // Within 1 year of expiration: For Renewal
     return { label: 'For Renewal', color: 'yellow' }
   } else {
-    // Over 1 year past expiration: Closed
-    return { label: 'Closed', color: 'red' }
+    // Over 1 year past expiration: Not Operational
+    return { label: 'Not Operational', color: 'red' }
   }
 }
 
 function getStatusBadgeClass(status) {
   if (!status) return 'bg-gray-50 text-gray-600 border-gray-200'
-  if (status.includes('Operational')) return 'bg-green-50 text-green-700 border-green-200'
+  if (status === 'Operational') return 'bg-green-50 text-green-700 border-green-200'
   if (status === 'For Renewal') return 'bg-yellow-50 text-yellow-700 border-yellow-200'
-  if (status === 'Closed') return 'bg-red-50 text-red-700 border-red-200'
+  if (status === 'Not Operational') return 'bg-red-50 text-red-700 border-red-200'
   return 'bg-gray-50 text-gray-600 border-gray-200'
 }
 
@@ -1958,7 +1981,6 @@ const groupedResults = computed(() => {
         schoolName: s ? s.name : 'Unknown',
         schoolAddress: s ? s.address : '',
         schoolType: s ? s.type : 'Private',
-        status: s ? s.status : 'No Permits',
         latitude: s ? s.latitude : null,
         longitude: s ? s.longitude : null,
         permits: []
@@ -1966,7 +1988,13 @@ const groupedResults = computed(() => {
     }
     grouped[p.schoolId].permits.push(p)
   })
+  
   let results = Object.values(grouped)
+  
+  // Calculate final status for each group based on latest permit
+  results.forEach(r => {
+    r.status = getOverallSchoolStatus(r.permits).label
+  })
 
   // Handle Duplicate Names (Branch Detection)
   const nameCounts = {}
@@ -2233,26 +2261,16 @@ const showEmptyState = computed(() => {
                             </div>
                           </div>
                           <div class="flex gap-2 shrink-0">
-                            <span 
-                              class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
-                              :class="{
-                                'bg-purple-50 text-purple-700 border-purple-200': group.schoolType === 'Private',
-                                'bg-blue-50 text-blue-700 border-blue-200': group.schoolType === 'Public',
-                                'bg-orange-50 text-orange-700 border-orange-200': group.schoolType === 'Homeschooling'
-                              }"
+                            <span v-if="group.schoolType === 'Homeschooling'"
+                              class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap bg-orange-50 text-orange-700 border-orange-200"
                             >
                               {{ group.schoolType }}
                             </span>
                             <span 
                               class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
-                              :class="{
-                                'bg-emerald-50 text-emerald-700 border-emerald-200': getOverallSchoolStatus(group.permits).color === 'green',
-                                'bg-amber-50 text-amber-700 border-amber-200': getOverallSchoolStatus(group.permits).color === 'yellow',
-                                'bg-red-50 text-red-700 border-red-200': getOverallSchoolStatus(group.permits).color === 'red',
-                                'bg-gray-50 text-gray-700 border-gray-200': getOverallSchoolStatus(group.permits).color === 'gray'
-                              }"
+                              :class="getStatusBadgeClass(getOverallSchoolStatus(group.permits).label)"
                             >
-                              Status: {{ getOverallSchoolStatus(group.permits).label }}
+                              {{ getOverallSchoolStatus(group.permits).label }}
                             </span>
                           </div>
                         </div>
@@ -2354,26 +2372,16 @@ const showEmptyState = computed(() => {
                       </div>
                     </div>
                     <div class="flex gap-2 shrink-0">
-                      <span 
-                        class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
-                        :class="{
-                          'bg-purple-50 text-purple-700 border-purple-200': group.schoolType === 'Private',
-                          'bg-blue-50 text-blue-700 border-blue-200': group.schoolType === 'Public',
-                          'bg-orange-50 text-orange-700 border-orange-200': group.schoolType === 'Homeschooling'
-                        }"
+                      <span v-if="group.schoolType === 'Homeschooling'"
+                        class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap bg-orange-50 text-orange-700 border-orange-200"
                       >
                         {{ group.schoolType }}
                       </span>
                       <span 
                         class="px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap"
-                        :class="{
-                          'bg-emerald-50 text-emerald-700 border-emerald-200': getOverallSchoolStatus(group.permits).color === 'green',
-                          'bg-amber-50 text-amber-700 border-amber-200': getOverallSchoolStatus(group.permits).color === 'yellow',
-                          'bg-red-50 text-red-700 border-red-200': getOverallSchoolStatus(group.permits).color === 'red',
-                          'bg-gray-50 text-gray-700 border-gray-200': getOverallSchoolStatus(group.permits).color === 'gray'
-                        }"
+                        :class="getStatusBadgeClass(getOverallSchoolStatus(group.permits).label)"
                       >
-                        Status: {{ getOverallSchoolStatus(group.permits).label }}
+                        {{ getOverallSchoolStatus(group.permits).label }}
                       </span>
                     </div>
                   </div>
@@ -2433,34 +2441,6 @@ const showEmptyState = computed(() => {
               </div>
            </template>
 
-          </div>
-
-          <!-- Right: Sticky Map -->
-          <div class="hidden lg:block lg:col-span-1">
-             <div class="sticky top-6">
-                <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col h-[calc(100vh-8rem)]">
-                   <div class="p-3 border-b border-slate-100 bg-slate-50 flex items-center justify-between">
-                      <h3 class="font-semibold text-slate-700 text-sm flex items-center gap-2">
-                         <MapPin :size="16" />
-                         School Location
-                      </h3>
-                      <span v-if="selectedSchool" class="text-xs text-slate-500 truncate max-w-[150px]">
-                         {{ selectedSchool.name }}
-                      </span>
-                      <span v-else class="text-xs text-slate-400 italic">Select a school</span>
-                   </div>
-                   <div class="flex-1 relative bg-slate-100">
-                      <div ref="mapContainerView" class="absolute inset-0 z-0"></div>
-                      <div v-if="!selectedSchool" class="absolute inset-0 flex items-center justify-center bg-slate-50/80 backdrop-blur-sm z-10 p-6 text-center">
-                         <div>
-                            <MapPin :size="48" class="text-slate-300 mx-auto mb-2" />
-                            <p class="text-slate-500 font-medium">Select a school to view map</p>
-                            <p class="text-xs text-slate-400 mt-1">Click on any school card from the list</p>
-                         </div>
-                      </div>
-                   </div>
-                </div>
-             </div>
           </div>
       </div>
         
@@ -2585,9 +2565,19 @@ const showEmptyState = computed(() => {
                       file:bg-sky-50 file:text-sky-700
                       hover:file:bg-sky-100"
                  />
-                 <div v-if="schoolForm.ocrLoading" class="flex items-center text-sky-600 text-sm">
-                   <Loader2 class="w-4 h-4 mr-2 animate-spin" />
-                   Scanning...
+                 <div v-if="schoolForm.ocrLoading" class="flex items-center gap-3 text-sky-600 text-sm">
+                   <div class="relative w-9 h-9">
+                     <FileImage class="w-9 h-9 text-sky-500" />
+                     <div class="absolute left-2 right-2 h-1.5 bg-sky-400/80 rounded-full animate-scan-vertical"></div>
+                   </div>
+                   <div class="flex flex-col">
+                     <span class="font-medium">Scanning document...</span>
+                     <span class="text-[11px] text-slate-500">Auto-detecting school name, address, and permits</span>
+                   </div>
+                 </div>
+                 <div v-else-if="schoolForm.extractedText" class="flex items-center gap-2 text-xs text-emerald-600">
+                   <CheckCircle class="w-4 h-4" />
+                   <span>Scan complete • Details auto-filled</span>
                  </div>
               </div>
               <p class="text-xs text-slate-500 mt-2">Upload a permit or registration document to auto-detect details.</p>

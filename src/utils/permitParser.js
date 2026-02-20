@@ -64,10 +64,8 @@ export function extractSchoolInfoFromText(text) {
 
   const cleanText = cleanOCRText(text)
   
-  // ─── Smart Context Detection ───
-  // Prioritize "Government Permit" or "Government Recognition" sections over Indorsements
   let textToAnalyze = cleanText
-  const permitHeaderMatch = cleanText.match(/(?:GOVERNMENT\s+(?:RECOGNITION|PERMIT)|AUTHORITY\s+TO\s+OPERATE)/i)
+  const permitHeaderMatch = cleanText.match(/(?:GOVERNMENT\s*(?:RECOGNITION|PERMIT)|AUTHORITY\s+TO\s+OPERATE)/i)
   if (permitHeaderMatch) {
      textToAnalyze = cleanText.substring(permitHeaderMatch.index)
   }
@@ -174,6 +172,23 @@ export function extractSchoolInfoFromText(text) {
     }
   }
 
+  if (!address && name) {
+    const lines = cleanTextForName.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+    const idx = lines.findIndex(l => l.includes(name))
+    if (idx !== -1) {
+      const after = []
+      if (idx + 1 < lines.length) after.push(lines[idx + 1])
+      if (idx + 2 < lines.length && !/\(School\)/i.test(lines[idx + 2]) && !/Track\b/i.test(lines[idx + 2])) {
+        after.push(lines[idx + 2])
+      }
+      let candidate = after.join(' ').trim()
+      if (candidate) {
+        candidate = candidate.replace(/\(Complete Address\)/i, '').trim()
+        address = candidate
+      }
+    }
+  }
+
   // Cleanup address
   if (address) {
     // Remove common trailing phrases and everything after them
@@ -209,8 +224,7 @@ export function extractPermitDetails(text) {
   const t = cleanOCRText(text)
   const permits = []
 
-  // Strategy 1: Standard GP pattern
-  const gpRegex = /(?:Government\s+Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number|#)?[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4}[-–]?\d{0,4})/gi
+  const gpRegex = /(?:Government\s*Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s*Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number|#)?[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4}[-–]?\d{0,4})/gi
   
   let match
   while ((match = gpRegex.exec(t)) !== null) {
@@ -247,8 +261,7 @@ export function extractPermitDetails(text) {
     })
   }
 
-  // Strategy 2: Government Recognition Pattern
-  const grRegex = /Government\s+Recognition(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number|#)?[\s:.]*([A-Z0-9\s-]+)?[\s,.]*(?:s\.?|series\s+of)\s*(\d{4}[-–]?\d{0,4})/gi
+  const grRegex = /Government\s*Recognition(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number|#)?[\s:.]*([A-Z0-9\s-]+)?[\s,.]*(?:s\.?|series\s+of)\s*(\d{4}[-–]?\d{0,4})/gi
   while ((match = grRegex.exec(t)) !== null) {
       const pNum = match[1] ? match[1].trim() : 'Gov. Rec.'
       if (pNum.length > 25) continue

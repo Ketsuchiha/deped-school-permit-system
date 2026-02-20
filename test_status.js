@@ -40,7 +40,7 @@ function getStatus(schoolYear, mockTodayDate) {
       return { label: 'Operational', color: 'green' }
   }
   if (daysPast <= 365) return { label: 'For Renewal', color: 'yellow' }
-  return { label: 'Closed', color: 'red' }
+  return { label: 'Not Operational', color: 'red' }
 }
 
 function hasPermitGap(permits) {
@@ -58,7 +58,7 @@ function hasPermitGap(permits) {
 
 function getOverallSchoolStatus(permits, mockTodayDate) {
   if (!permits || permits.length === 0) return { label: 'No Records', color: 'gray' }
-  if (hasPermitGap(permits)) return { label: 'Closed', color: 'red' }
+  if (hasPermitGap(permits)) return { label: 'Not Operational', color: 'red' }
 
   const sorted = [...permits].sort((a, b) => {
     const ya = parseSchoolYearEnd(a.schoolYear) || 0

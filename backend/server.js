@@ -238,7 +238,7 @@ function calculateSchoolStatus(permits) {
 
   // Logic
   if (currentYear > latestEndYear + 1) {
-    return 'Closed'; // Expired more than a year ago
+    return 'Not Operational'; // Expired more than a year ago
   } else if (currentYear >= latestEndYear) {
     return 'For Renewal'; // Expired recently or currently expiring
   } else if (hasGap) {
@@ -483,28 +483,27 @@ app.get('/api/geocode', async (req, res) => {
 app.get('/api/maps/proxy/:z/:x/:y', (req, res) => {
   const { z, x, y } = req.params;
   const https = require('https');
-  // CartoDB subdomains
-  const subdomain = ['a', 'b', 'c', 'd'][Math.floor(Math.random() * 4)];
-  const tileUrl = `https://${subdomain}.basemaps.cartocdn.com/rastertiles/voyager/${z}/${x}/${y}.png`;
   
-  // console.log(`[Proxy] Fetching: ${z}/${x}/${y} from ${subdomain}`);
-
+  // Use OpenStreetMap directly as fallback or primary if CartoDB is flaky
+  const tileUrl = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+  
   const options = {
     headers: {
-      'User-Agent': 'SchoolPermitSystem/1.0 (Student Project)',
-      'Accept': 'image/png,image/*;q=0.8',
-    }
+      'User-Agent': 'SchoolPermitSystem/1.0 (Contact: student@example.com)',
+      'Referer': 'http://localhost:3000/',
+    },
+    timeout: 5000
   };
   
   const proxyReq = https.get(tileUrl, options, (proxyRes) => {
     if (proxyRes.statusCode !== 200) {
-      // console.error(`[Proxy] Upstream Error: ${proxyRes.statusCode}`);
+      console.error(`[Proxy] OSM Error: ${proxyRes.statusCode} for ${z}/${x}/${y}`);
       proxyRes.resume();
       return res.status(proxyRes.statusCode).send('Upstream error');
     }
     
     res.setHeader('Content-Type', 'image/png');
-    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Cache-Control', 'public, max-age=604800'); // Cache for a week
     res.setHeader('Access-Control-Allow-Origin', '*');
     
     proxyRes.pipe(res);

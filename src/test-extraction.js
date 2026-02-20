@@ -36,11 +36,21 @@ Address: Poblacion, Biñan City
 `
 
 const mockPermitText4 = `
-REPVBLIC 0F THE PH1LIPP1NES
-D3PARTMENT 0F EDUC4TI0N
-GOV PERMIT No. 123-2024
-The H4PPY K1DS SCH00L
-locat3d at 456 M4in Rd, C1ty
+REPUBLIC OF THE PHILIPPINES
+DEPARTMENT OF EDUCATION
+REGION IV-A CALABARZON
+
+GOVERNMENT PERMIT (R-Renewal)
+SHS-062 s. 2018
+
+AGUSTINIAN SCHOOL OF CABUYAO LAGUNA, INC.
+60 Banay-Banay, Cabuyao City
+(Complete Address)
+
+Track                  Strand/Specialization
+Academic               Science, Technology, Engineering and Mathematics (STEM)
+
+This permit shall be valid for School Year 2018-2019.
 `
 
 console.log('--- TEST 1: Standard GP ---')
