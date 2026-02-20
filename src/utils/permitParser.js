@@ -116,10 +116,22 @@ export function extractSchoolInfoFromText(text) {
   // 3. Name Strategy: Explicit Labels "(School)"
   if (!name) {
     const lines = cleanTextForName.split('\n').map(l => l.trim())
+    const schoolKeywords = ['SCHOOL', 'ACADEMY', 'INSTITUTE', 'COLLEGE', 'UNIVERSITY', 'MONTESSORI', 'LEARNING', 'CENTER', 'KINDER', 'PRESCHOOL']
+    const hasSchoolKeyword = (line) => schoolKeywords.some(w => line.toUpperCase().includes(w))
+
     for (let i = 0; i < lines.length; i++) {
       if (/\(School\)/i.test(lines[i]) || /\(Name of School\)/i.test(lines[i])) {
+        let candidate = ''
         if (i > 0 && lines[i-1].length > 3 && !/^To$/i.test(lines[i-1])) {
-          name = lines[i-1]
+          candidate = lines[i-1]
+        }
+        // If the line before the label does not look like a school name, 
+        // but the line after does (common in some templates), prefer the line after.
+        if ((!candidate || !hasSchoolKeyword(candidate)) && i + 1 < lines.length && hasSchoolKeyword(lines[i + 1])) {
+          candidate = lines[i + 1]
+        }
+        if (candidate) {
+          name = candidate
           break
         }
       }
@@ -183,8 +195,28 @@ export function extractSchoolInfoFromText(text) {
       }
       let candidate = after.join(' ').trim()
       if (candidate) {
-        candidate = candidate.replace(/\(Complete Address\)/i, '').trim()
+        candidate = candidate
+          .replace(/\(Complete Address\)/i, '')
+          .replace(/\(School\)/i, '')
+          .trim()
         address = candidate
+      }
+    }
+  }
+
+  //  Additional Address Strategy: line after "(School)" label
+  if (!address) {
+    const lines = cleanTextForName.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+    for (let i = 0; i < lines.length; i++) {
+      if (/\(School\)/i.test(lines[i]) || /\(Name of School\)/i.test(lines[i])) {
+        if (i + 1 < lines.length) {
+          const candidate = lines[i + 1]
+          // Require at least one digit or common address keyword so we don't pick random text
+          if (/[0-9]/.test(candidate) || /(St\.?|Street|Brgy\.?|Barangay|City|Province|Poblacion)/i.test(candidate)) {
+            address = candidate.replace(/\(Complete Address\)/i, '').replace(/\(School\)/i, '').trim()
+            break
+          }
+        }
       }
     }
   }

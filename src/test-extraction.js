@@ -53,6 +53,24 @@ Academic               Science, Technology, Engineering and Mathematics (STEM)
 This permit shall be valid for School Year 2018-2019.
 `
 
+// Layout similar to Citi Global College permit where "(School)" appears
+// and the address is on the next line with numbers and street name.
+const mockPermitText5 = `
+REPUBLIC OF THE PHILIPPINES
+DEPARTMENT OF EDUCATION
+REGION IV-A CALABARZON
+
+GOVERNMENT PERMIT (SHS) No. SHS-999 s. 2024
+
+2001) and Republic Act No. 10533 (Enhanced Basic Education Act of 2013) ...
+
+CITI GLOBAL COLLEGE INC.
+(School)
+4 (School) 5 #13, P. Rizal St., Poblacion Dos, Cabuyao City
+
+This permit shall be valid for School Year 2024-2025.
+`
+
 console.log('--- TEST 1: Standard GP ---')
 const r1 = extractPermitDetails(mockPermitText1)
 const i1 = extractSchoolInfoFromText(mockPermitText1)
@@ -76,3 +94,9 @@ const r4 = extractPermitDetails(mockPermitText4)
 const i4 = extractSchoolInfoFromText(mockPermitText4)
 console.log('Permits:', JSON.stringify(r4, null, 2))
 console.log('Info:', JSON.stringify(i4, null, 2))
+
+console.log('\n--- TEST 5: Citi Global Style ---')
+const r5 = extractPermitDetails(mockPermitText5)
+const i5 = extractSchoolInfoFromText(mockPermitText5)
+console.log('Permits:', JSON.stringify(r5, null, 2))
+console.log('Info:', JSON.stringify(i5, null, 2))
