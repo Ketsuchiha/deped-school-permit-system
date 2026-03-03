@@ -1,43 +1,45 @@
-<script setup>
+<script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ChevronDown, Check } from 'lucide-vue-next'
 
-const props = defineProps({
-  modelValue: {
-    type: String,
-    required: true
-  },
-  options: {
-    type: Array,
-    default: () => []
-  },
-  placeholder: {
-    type: String,
-    default: 'Select...'
-  }
+interface Option {
+  value: string;
+  label: string;
+}
+
+defineOptions({
+  name: 'CustomSelect'
 })
 
-const emit = defineEmits(['update:modelValue'])
+const props = defineProps<{
+  modelValue: string;
+  options: Option[];
+  placeholder?: string;
+}>()
+
+const emit = defineEmits<{
+  (e: 'update:modelValue', value: string): void
+}>()
 
 const isOpen = ref(false)
-const containerRef = ref(null)
+const containerRef = ref<HTMLElement | null>(null)
 
 const selectedLabel = computed(() => {
-  const option = props.options.find(o => o.value === props.modelValue)
-  return option ? option.label : props.placeholder
+  const option = props.options.find((o: Option) => o.value === props.modelValue)
+  return option ? option.label : (props.placeholder || 'Select...')
 })
 
 function toggleDropdown() {
   isOpen.value = !isOpen.value
 }
 
-function selectOption(value) {
+function selectOption(value: string) {
   emit('update:modelValue', value)
   isOpen.value = false
 }
 
-function closeDropdown(e) {
-  if (containerRef.value && !containerRef.value.contains(e.target)) {
+function closeDropdown(e: MouseEvent) {
+  if (containerRef.value && !containerRef.value.contains(e.target as Node)) {
     isOpen.value = false
   }
 }
@@ -48,6 +50,13 @@ onMounted(() => {
 
 onUnmounted(() => {
   document.removeEventListener('click', closeDropdown)
+})
+</script>
+
+<script lang="ts">
+import { defineComponent } from 'vue'
+export default defineComponent({
+  name: 'CustomSelect'
 })
 </script>
 

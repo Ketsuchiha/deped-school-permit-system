@@ -1,6 +1,5 @@
-
 // Helper to clean common OCR errors
-export function cleanOCRText(text) {
+export function cleanOCRText(text: string | null | undefined): string {
   if (!text) return ''
   return text
     .replace(/SCH00L/gi, 'SCHOOL')
@@ -22,13 +21,23 @@ export function cleanOCRText(text) {
     .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '')
 }
 
+interface SchoolInfo {
+  schoolName: string;
+  address: string;
+}
+
+interface ConfidenceResult {
+  score: number;
+  errors: string[];
+}
+
 /**
  * Calculates a confidence score (0-100) based on extracted fields.
  * If essential fields are missing, confidence drops.
  */
-export function calculateConfidence(info) {
+export function calculateConfidence(info: SchoolInfo): ConfidenceResult {
   let score = 100
-  const errors = []
+  const errors: string[] = []
   
   if (!info.schoolName) {
     score -= 40
@@ -59,7 +68,12 @@ export function calculateConfidence(info) {
   return { score: Math.max(0, score), errors }
 }
 
-export function extractSchoolInfoFromText(text) {
+interface ExtractionResult extends SchoolInfo {
+  confidence: number;
+  errors: string[];
+}
+
+export function extractSchoolInfoFromText(text: string | null | undefined): ExtractionResult {
   if (!text) return { schoolName: '', address: '', confidence: 0, errors: ['NO_TEXT_EXTRACTED'] }
 
   const cleanText = cleanOCRText(text)
@@ -67,7 +81,7 @@ export function extractSchoolInfoFromText(text) {
   let textToAnalyze = cleanText
   const permitHeaderMatch = cleanText.match(/(?:GOVERNMENT\s*(?:RECOGNITION|PERMIT)|AUTHORITY\s+TO\s+OPERATE)/i)
   if (permitHeaderMatch) {
-     textToAnalyze = cleanText.substring(permitHeaderMatch.index)
+     textToAnalyze = cleanText.substring(permitHeaderMatch.index!)
   }
 
   // Block signatures (Clean text)
@@ -85,7 +99,7 @@ export function extractSchoolInfoFromText(text) {
   for (const marker of signatureMarkers) {
     const match = cleanTextForName.match(marker)
     if (match) {
-       cleanTextForName = cleanTextForName.substring(0, match.index).trim()
+       cleanTextForName = cleanTextForName.substring(0, match.index!).trim()
        break 
     }
   }
@@ -117,7 +131,7 @@ export function extractSchoolInfoFromText(text) {
   if (!name) {
     const lines = cleanTextForName.split('\n').map(l => l.trim())
     const schoolKeywords = ['SCHOOL', 'ACADEMY', 'INSTITUTE', 'COLLEGE', 'UNIVERSITY', 'MONTESSORI', 'LEARNING', 'CENTER', 'KINDER', 'PRESCHOOL']
-    const hasSchoolKeyword = (line) => schoolKeywords.some(w => line.toUpperCase().includes(w))
+    const hasSchoolKeyword = (line: string) => schoolKeywords.some(w => line.toUpperCase().includes(w))
 
     for (let i = 0; i < lines.length; i++) {
       if (/\(School\)/i.test(lines[i]) || /\(Name of School\)/i.test(lines[i])) {
@@ -188,7 +202,7 @@ export function extractSchoolInfoFromText(text) {
     const lines = cleanTextForName.split('\n').map(l => l.trim()).filter(l => l.length > 0)
     const idx = lines.findIndex(l => l.includes(name))
     if (idx !== -1) {
-      const after = []
+      const after: string[] = []
       if (idx + 1 < lines.length) after.push(lines[idx + 1])
       if (idx + 2 < lines.length && !/\(School\)/i.test(lines[idx + 2]) && !/Track\b/i.test(lines[idx + 2])) {
         after.push(lines[idx + 2])
@@ -233,8 +247,8 @@ export function extractSchoolInfoFromText(text) {
   return { schoolName: name, address, confidence: score, errors }
 }
 
-function detectStrands(txt) {
-  const found = []
+function detectStrands(txt: string): string[] {
+  const found: string[] = []
   if (/STEM|Science,? Technology,? Engineering,? (?:and|&) Mathematics/i.test(txt)) found.push('STEM')
   if (/ABM|Accountancy,? Business,? (?:and|&) Management/i.test(txt)) found.push('ABM')
   if (/HUMSS|Humanities (?:and|&) Social Sciences/i.test(txt)) found.push('HUMSS')
@@ -245,20 +259,27 @@ function detectStrands(txt) {
   return found
 }
 
-function findSchoolYearInContext(context) {
+function findSchoolYearInContext(context: string): string | null {
   const match = context.match(/(?:SY|S\.Y\.|School\s+Year)[\s:.]*(\d{4}[-–]\d{4})/i)
   return match ? match[1] : null
 }
 
-export function extractPermitDetails(text) {
+interface PermitDetail {
+  permitNumber: string;
+  schoolYear: string;
+  levels: string[];
+  strands: string[];
+}
+
+export function extractPermitDetails(text: string | null | undefined): PermitDetail[] {
   if (!text) return []
 
   const t = cleanOCRText(text)
-  const permits = []
+  const permits: PermitDetail[] = []
 
   const gpRegex = /(?:Government\s*Permit|GP|Provisional\s+Permit|Authority\s+to\s+Operate|DepEd\s*Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number|#)?[\s:.]*([A-Z0-9\s-]+)[\s,.]*(?:s\.?|series\s+of)\s*(\d{4}[-–]?\d{0,4})/gi
   
-  let match
+  let match: RegExpExecArray | null
   while ((match = gpRegex.exec(t)) !== null) {
     const pNum = match[1].trim()
     let sYear = match[2].trim()
@@ -272,7 +293,7 @@ export function extractPermitDetails(text) {
       if (betterYear) sYear = betterYear
     }
 
-    const levels = []
+    const levels: string[] = []
     if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
     else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
     else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School') 
@@ -283,6 +304,53 @@ export function extractPermitDetails(text) {
        if (/(?:Elementary|Grades\s+1[-–]6|Primary)/i.test(context)) levels.push('Elementary')
        if (/(?:Junior\s+High|JHS|Grades\s+7[-–]10)/i.test(context)) levels.push('Junior High School')
        if (/(?:Senior\s+High|SHS|Grades\s+11[-–]12)/i.test(context)) levels.push('Senior High School')
+    }
+
+    permits.push({
+      permitNumber: pNum,
+      schoolYear: sYear,
+      levels: [...new Set(levels)],
+      strands: levels.includes('Senior High School') ? detectStrands(context) : []
+    })
+  }
+
+  // Strategy 4: "No. SHS-123" with School Year elsewhere in context
+  const noOnlyRegex = /(?:No\.?|Number|#)\s*([A-Z]{1,4}\s*[-]?\s*\d{2,5})/gi
+  while ((match = noOnlyRegex.exec(t)) !== null) {
+    const raw = match[1].replace(/\s+/g, '')
+    if (!/^[A-Z]{1,4}-?\d{2,5}$/.test(raw)) continue
+
+    // Normalize to PREFIX-NNN form
+    const parts = raw.split('-')
+    let prefix = parts[0]
+    let numPart = parts[1] || ''
+    if (!numPart && prefix.length > 1) {
+      numPart = prefix.slice(1)
+      prefix = prefix[0]
+    }
+    prefix = prefix.toUpperCase()
+    if (prefix === 'S' && numPart.length <= 3) prefix = 'SHS'
+    const pNum = `${prefix}-${numPart}`
+
+    const context = t.substring(Math.max(0, match.index - 1000), match.index + 1000)
+    const sYear = findSchoolYearInContext(context)
+    if (!sYear) continue
+
+    // Skip duplicates if already captured by previous strategies
+    const exists = permits.some(p => p.permitNumber === pNum && p.schoolYear === sYear)
+    if (exists) continue
+
+    const levels: string[] = []
+    if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
+    else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
+    else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School')
+    else if (/^SHS[-]/i.test(pNum)) levels.push('Senior High School')
+
+    if (levels.length === 0) {
+      if (/(?:Kindergarten|Pre[- ]?Elementary|Preschool)/i.test(context)) levels.push('Kindergarten')
+      if (/(?:Elementary|Grades\s+1[-–]6|Primary)/i.test(context)) levels.push('Elementary')
+      if (/(?:Junior\s+High|JHS|Grades\s+7[-–]10)/i.test(context)) levels.push('Junior High School')
+      if (/(?:Senior\s+High|SHS|Grades\s+11[-–]12)/i.test(context)) levels.push('Senior High School')
     }
 
     permits.push({
@@ -306,7 +374,7 @@ export function extractPermitDetails(text) {
         if (betterYear) sYear = betterYear
       }
 
-      const levels = []
+      const levels: string[] = []
       if (/(?:Kindergarten|Pre[- ]?Elementary|Preschool)/i.test(context)) levels.push('Kindergarten')
       if (/(?:Elementary|Grades\s+1[-–]6|Primary)/i.test(context)) levels.push('Elementary')
       if (/(?:Junior\s+High|JHS|Grades\s+7[-–]10)/i.test(context)) levels.push('Junior High School')
@@ -347,15 +415,15 @@ export function extractPermitDetails(text) {
   }
 
   // Deduplicate and Merge
-  const uniquePermits = []
-  const permitMap = new Map()
+  const uniquePermits: PermitDetail[] = []
+  const permitMap = new Map<string, PermitDetail>()
 
   permits.forEach(p => {
     // Normalize Permit Number for key (remove spacing differences)
     const key = p.permitNumber.replace(/\s+/g, '').toUpperCase()
     
     if (permitMap.has(key)) {
-      const existing = permitMap.get(key)
+      const existing = permitMap.get(key)!
       // Merge logic: prefer longer school year (e.g. 2024-2025 over 2024)
       if (p.schoolYear.length > existing.schoolYear.length) {
         existing.schoolYear = p.schoolYear

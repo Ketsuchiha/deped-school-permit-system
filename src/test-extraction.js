@@ -71,6 +71,23 @@ CITI GLOBAL COLLEGE INC.
 This permit shall be valid for School Year 2024-2025.
 `
 
+// Permit where "No. SHS-777" and "School Year 2024-2025" are separated
+const mockPermitText6 = `
+REPUBLIC OF THE PHILIPPINES
+DEPARTMENT OF EDUCATION
+REGION IV-A CALABARZON
+
+GOVERNMENT PERMIT (SHS)
+No. SHS-777
+
+This authority is granted to operate the Senior High School program.
+
+The permit covers the following:
+- Academic Track
+
+School Year 2024-2025
+`
+
 console.log('--- TEST 1: Standard GP ---')
 const r1 = extractPermitDetails(mockPermitText1)
 const i1 = extractSchoolInfoFromText(mockPermitText1)
@@ -100,3 +117,9 @@ const r5 = extractPermitDetails(mockPermitText5)
 const i5 = extractSchoolInfoFromText(mockPermitText5)
 console.log('Permits:', JSON.stringify(r5, null, 2))
 console.log('Info:', JSON.stringify(i5, null, 2))
+
+console.log('\n--- TEST 6: No-only Permit with Separate SY ---')
+const r6 = extractPermitDetails(mockPermitText6)
+const i6 = extractSchoolInfoFromText(mockPermitText6)
+console.log('Permits:', JSON.stringify(r6, null, 2))
+console.log('Info:', JSON.stringify(i6, null, 2))

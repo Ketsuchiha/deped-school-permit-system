@@ -55,6 +55,7 @@ function initDb() {
       name TEXT NOT NULL,
       type TEXT NOT NULL,
       address TEXT,
+      operationalStatus TEXT,
       deleted INTEGER DEFAULT 0,
       deletedAt DATETIME
     )`);
@@ -82,12 +83,15 @@ function initDb() {
       columns.forEach(col => {
         const type = col === 'deleted' ? 'INTEGER DEFAULT 0' : 'DATETIME';
         db.run(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`, (err) => {
-          // Ignore error if column already exists
           if (err && !err.message.includes('duplicate column name')) {
-            // console.log(`Column ${col} already exists in ${table} or error:`, err.message);
           }
         });
       });
+    });
+
+    db.run(`ALTER TABLE schools ADD COLUMN operationalStatus TEXT`, (err) => {
+      if (err && !err.message.includes('duplicate column name')) {
+      }
     });
 
     // Migration: Add localFilePath to permits
@@ -240,7 +244,7 @@ function calculateSchoolStatus(permits) {
   if (currentYear > latestEndYear + 1) {
     return 'Not Operational'; // Expired more than a year ago
   } else if (currentYear >= latestEndYear) {
-    return 'For Renewal'; // Expired recently or currently expiring
+    return 'Renewal'; // Expired recently or currently expiring
   } else if (hasGap) {
     // Recent permit exists but history has gaps?
     // The prompt says "Closed: If the system detects a gap of one year or more in the permit sequence"
@@ -267,9 +271,7 @@ app.get('/api/schools', (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
     
     const schools = rows.map(row => {
-      const permitYears = JSON.parse(row.permit_years || '[]').filter(p => p.schoolYear);
-      const status = calculateSchoolStatus(permitYears);
-      // Remove the temp field
+      const status = row.operationalStatus || 'Operational';
       delete row.permit_years;
       return { ...row, status };
     });
@@ -280,7 +282,7 @@ app.get('/api/schools', (req, res) => {
 
 // Create a school
 app.post('/api/schools', async (req, res) => {
-  const { id, name, type, address } = req.body;
+  const { id, name, type, address, operationalStatus } = req.body;
   
   let lat = null, lng = null, acc = null, status = 'PENDING';
 
@@ -302,11 +304,11 @@ app.post('/api/schools', async (req, res) => {
     status = 'SYSTEM_ERROR';
   }
 
-  const sql = `INSERT INTO schools (id, name, type, address, latitude, longitude, geo_accuracy, geo_status, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`;
+  const sql = `INSERT INTO schools (id, name, type, address, operationalStatus, latitude, longitude, geo_accuracy, geo_status, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`;
 
-  db.run(sql, [id, name, type, address, lat, lng, acc, status], function(err) {
+  db.run(sql, [id, name, type, address, operationalStatus || 'Operational', lat, lng, acc, status], function(err) {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ id, name, type, address, latitude: lat, longitude: lng, geo_accuracy: acc, geo_status: status, deleted: 0 });
+    res.json({ id, name, type, address, operationalStatus: operationalStatus || 'Operational', latitude: lat, longitude: lng, geo_accuracy: acc, geo_status: status, deleted: 0 });
   });
 });
 
@@ -321,6 +323,106 @@ app.get('/api/permits', (req, res) => {
       filePreviewUrl: p.filePath
     }));
     res.json(permits);
+  });
+});
+
+// Yearly permits summary report (CSV for Excel)
+app.get('/api/reports/permits', (req, res) => {
+  const { year } = req.query;
+  const params = [];
+  let where = ' (p.deleted = 0 OR p.deleted IS NULL) AND (s.deleted = 0 OR s.deleted IS NULL) ';
+
+  const fromYear = 2018;
+
+  if (year && /^\d{4}$/.test(year)) {
+    where += ' AND (p.schoolYear LIKE ? OR p.schoolYear LIKE ?)';
+    params.push(`${year}-%`);
+    params.push(`%${year}%`);
+  } else {
+    where += ' AND CAST(substr(p.schoolYear, 1, 4) AS INTEGER) >= ?';
+    params.push(fromYear);
+  }
+
+  const sql = `
+    SELECT
+      p.id AS permitId,
+      s.id AS schoolId,
+      s.name AS schoolName,
+      s.type AS schoolType,
+      s.address AS schoolAddress,
+      p.schoolYear,
+      p.permitNumber,
+      p.levels,
+      p.fileName,
+      s.geo_status AS geoStatus,
+      s.geo_accuracy AS geoAccuracy
+    FROM permits p
+    JOIN schools s ON s.id = p.schoolId
+    WHERE ${where}
+    ORDER BY p.schoolYear, s.name
+  `;
+
+  db.all(sql, params, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    const csvEscape = (value) => {
+      if (value === null || value === undefined) return '';
+      const s = String(value).replace(/"/g, '""');
+      return /[",\n]/.test(s) ? `"${s}"` : s;
+    };
+
+    const headers = [
+      'Permit ID',
+      'School ID',
+      'School Name',
+      'School Type',
+      'School Address',
+      'Permit Number',
+      'School Year',
+      'Levels',
+      'File Name',
+      'Geo Status',
+      'Geo Accuracy'
+    ];
+
+    const lines = [];
+    lines.push(headers.map(csvEscape).join(','));
+
+    rows.forEach((row) => {
+      let levels = row.levels;
+      try {
+        const arr = JSON.parse(row.levels || '[]');
+        if (Array.isArray(arr)) levels = arr.join('; ');
+      } catch (_) {
+        levels = row.levels;
+      }
+
+      const values = [
+        row.permitId,
+        row.schoolId,
+        row.schoolName,
+        row.schoolType,
+        row.schoolAddress,
+        row.permitNumber,
+        row.schoolYear,
+        levels || '',
+        row.fileName || '',
+        row.geoStatus || '',
+        row.geoAccuracy || ''
+      ];
+
+      lines.push(values.map(csvEscape).join(','));
+    });
+
+    const csv = lines.join('\r\n');
+    const labelYear = year && /^\d{4}$/.test(year) ? year : `${fromYear}-present`;
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="permits-summary-${labelYear}.csv"`
+    );
+    res.send(csv);
   });
 });
 
@@ -373,9 +475,9 @@ app.post('/api/permits', upload.single('file'), (req, res) => {
 // Update a school
 app.put('/api/schools/:id', (req, res) => {
   const { id } = req.params;
-  const { name, type, address } = req.body;
-  const sql = `UPDATE schools SET name = ?, type = ?, address = ? WHERE id = ?`;
-  db.run(sql, [name, type, address, id], function(err) {
+  const { name, type, address, operationalStatus } = req.body;
+  const sql = `UPDATE schools SET name = ?, type = ?, address = ?, operationalStatus = ? WHERE id = ?`;
+  db.run(sql, [name, type, address, operationalStatus || 'Operational', id], function(err) {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ id, name, type, address });
   });

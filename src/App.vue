@@ -1,20 +1,94 @@
-<script setup>
+<script setup lang="ts">
 import { ref, computed, watch, onMounted, nextTick } from 'vue'
-import { Shield, Home, Building2, Search, Plus, Upload, Calendar, FileImage, Loader2, CheckCircle, XCircle, BarChart3, PieChart, LayoutDashboard, Pencil, Trash2, RotateCcw, RotateCw, Eye, Download, MapPin, History, MapPinOff, AlertTriangle } from 'lucide-vue-next'
+import { Shield, Building2, Search, Plus, Upload, FileImage, Loader2, CheckCircle, XCircle, BarChart3, LayoutDashboard, Pencil, Trash2, RotateCcw, RotateCw, Eye, Download, MapPin, History, MapPinOff, AlertTriangle } from 'lucide-vue-next'
 import Tesseract from 'tesseract.js'
-import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf'
-import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
+import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf.mjs'
+import workerSrc from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 import CustomSelect from './components/CustomSelect.vue'
-import { extractPermitDetails, extractSchoolInfoFromText, calculateConfidence } from './utils/permitParser.js'
-import L from 'leaflet'
+import { extractPermitDetails, extractSchoolInfoFromText } from './utils/permitParser.js'
+import * as L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+
+// ─── Interfaces ─────────────────────────────────────────────────────────────
+interface School {
+  id: string;
+  name: string;
+  type: string;
+  address: string;
+  operationalStatus: string;
+  latitude: number | null;
+  longitude: number | null;
+  geo_accuracy?: string | null;
+  geo_status?: string | null;
+  deleted?: number;
+  deletedAt?: string | null;
+  manualStatus?: string | null;
+}
+
+interface Permit {
+  id: string;
+  schoolId: string;
+  school_id?: string;
+  levels: string[];
+  schoolYear: string;
+  permitNumber: string;
+  extractedText: string;
+  fileName: string;
+  filePreviewUrl: string;
+  filePath?: string | null;
+  localFilePath?: string | null;
+  createdAt?: string;
+  deleted?: number;
+  deletedAt?: string | null;
+  schoolName?: string;
+  file?: File | null;
+  strands?: string[];
+  manualStatus?: string | null;
+}
+
+interface GroupedSchool {
+  schoolId: string;
+  schoolName: string;
+  schoolAddress: string;
+  schoolType: string;
+  status: string;
+  latitude: number | null;
+  longitude: number | null;
+  permits: Permit[];
+  isDuplicateName: boolean;
+  branchIdentifier: string;
+}
+
+interface TrashItem {
+  id: string;
+  type: 'school' | 'permit';
+  title: string;
+  subtitle: string;
+  deletedAt: string;
+  badgeColor: string;
+}
+
+interface PermitForm {
+  schoolId: string;
+  levels: string[];
+  schoolYear: string;
+  file: File | null;
+  filePreviewUrl: string | null;
+  permitNumber: string;
+  fileName: string;
+  extractedText: string;
+  strands: string[];
+}
 
 // Fix for Leaflet marker icons in Vue/Vite environment
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
 import markerIcon from 'leaflet/dist/images/marker-icon.png'
 import markerShadow from 'leaflet/dist/images/marker-shadow.png'
 
-delete L.Icon.Default.prototype._getIconUrl
+// Fix Leaflet type issue for icon prototype
+const DefaultIcon = L.Icon.Default as any
+delete DefaultIcon.prototype._getIconUrl
+
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: markerIcon2x,
   iconUrl: markerIcon,
@@ -24,7 +98,7 @@ L.Icon.Default.mergeOptions({
 GlobalWorkerOptions.workerSrc = workerSrc
 
 // ─── View state ─────────────────────────────────────────────────────────────
-const currentView = ref('admin') // 'search' | 'admin'
+const currentView = ref<string>('admin') // 'search' | 'admin' | 'registration' | 'trash'
 
 const API_URL = 'http://localhost:3000/api'
 
@@ -35,28 +109,30 @@ const summaryStats = computed(() => {
   const totalPermits = permits.value.length
   
   // Breakdown by level (Permits can have multiple levels)
-  const levels = {
+  const levels: Record<string, number> = {
     'Kindergarten': 0,
     'Elementary': 0,
     'Junior High School': 0,
     'Senior High School': 0
   }
   
-  permits.value.forEach(p => {
+  permits.value.forEach((p: Permit) => {
     // p.levels is an array from backend
     const pLevels = Array.isArray(p.levels) ? p.levels : []
-    pLevels.forEach(l => {
+    pLevels.forEach((l: string) => {
       if (levels[l] !== undefined) levels[l]++
     })
   })
   
   // Recent Permits (Last 5)
-  const recentPermits = [...permits.value].sort((a, b) => {
-    // Sort by ID assuming chronological or add date field later. 
-    // For now, reverse order of array (newest last usually) or use ID timestamp if possible
-    return b.id.localeCompare(a.id) 
-  }).slice(0, 5).map(p => {
-    const s = schools.value.find(sc => sc.id === p.school_id)
+  const sortedPermits = [...permits.value].sort((a: Permit, b: Permit) => {
+    const idA = a.id || ''
+    const idB = b.id || ''
+    return idB.localeCompare(idA) 
+  })
+  
+  const recentPermits = sortedPermits.slice(0, 5).map((p: Permit) => {
+    const s = schools.value.find((sc: School) => sc.id === (p.school_id || p.schoolId))
     return { ...p, schoolName: s ? s.name : 'Unknown' }
   })
 
@@ -64,16 +140,34 @@ const summaryStats = computed(() => {
 })
 
 // ─── Data: schools (create first) and permits ───────────────────────────────
-const schools = ref([])
-const permits = ref([])
-const previewPermit = ref(null)
+const schools = ref<School[]>([])
+const permits = ref<Permit[]>([])
+const previewPermit = ref<Permit | null>(null)
 
 // ─── Edit / Delete Logic ─────────────────────────────────────────────────────
 const isEditingSchool = ref(false)
 const isEditingPermit = ref(false)
-const editSchoolForm = ref({})
-const editPermitForm = ref({})
-const editSchoolPermits = ref([])
+const editSchoolForm = ref<School>({
+  id: '',
+  name: '',
+  type: 'Private',
+  address: '',
+  operationalStatus: 'Operational',
+  latitude: null,
+  longitude: null
+})
+const editPermitForm = ref<PermitForm>({
+  schoolId: '',
+  levels: [],
+  schoolYear: '',
+  file: null,
+  filePreviewUrl: null,
+  permitNumber: '',
+  fileName: '',
+  extractedText: '',
+  strands: []
+})
+const editSchoolPermits = ref<Permit[]>([])
 
 async function refreshData() {
   try {
@@ -85,20 +179,20 @@ async function refreshData() {
     if (permitsRes.ok) permits.value = await permitsRes.json()
     // Fetch trash count for dashboard
     fetchTrash()
-  } catch (error) {
+  } catch (error: any) {
     console.error('Failed to fetch data:', error)
   }
 }
 
 // School CRUD
-function openEditSchool(schoolId) {
-  const s = schools.value.find(s => s.id === schoolId)
+function openEditSchool(schoolId: string) {
+  const s = schools.value.find((s: School) => s.id === schoolId)
   if (!s) return
   editSchoolForm.value = { ...s }
   isEditingSchool.value = true
   editSchoolPermits.value = permits.value
-    .filter(p => p.schoolId === schoolId)
-    .map(p => ({
+    .filter((p: Permit) => (p.school_id || p.schoolId) === schoolId)
+    .map((p: Permit) => ({
       id: p.id,
       schoolId: p.schoolId,
       levels: Array.isArray(p.levels) ? [...p.levels] : [],
@@ -106,11 +200,12 @@ function openEditSchool(schoolId) {
       permitNumber: p.permitNumber || '',
       extractedText: p.extractedText || '',
       fileName: p.fileName || '',
-      filePreviewUrl: p.filePreviewUrl || ''
+      filePreviewUrl: p.filePreviewUrl || '',
+      manualStatus: p.manualStatus || null
     }))
 }
 
-async function deleteSchool(schoolId) {
+async function deleteSchool(schoolId: string) {
   const confirmed = await confirmAction('Are you sure you want to delete this school? All its permits will also be deleted.')
   if (!confirmed) return
   
@@ -126,7 +221,7 @@ async function deleteSchool(schoolId) {
     } else {
       throw new Error('Failed to delete')
     }
-  } catch (err) {
+  } catch (err: any) {
     showToast('Failed to delete school', 'error')
   }
 }
@@ -160,17 +255,17 @@ async function saveEditSchool() {
     } else {
       throw new Error('Failed to update')
     }
-  } catch (err) {
+  } catch (err: any) {
     showToast('Failed to update school', 'error')
   }
 }
 
 // ─── Edit School Map Logic ──────────────────────────────────────────────────
-const mapContainerEdit = ref(null)
+const mapContainerEdit = ref<HTMLElement | null>(null)
 const isGeocodingEdit = ref(false)
-let mapInstanceEdit = null
-let markerInstanceEdit = null
-let debounceTimerEdit = null
+let mapInstanceEdit: L.Map | null = null
+let markerInstanceEdit: L.Marker | null = null
+let debounceTimerEdit: ReturnType<typeof setTimeout> | null = null
 
 function debounceGeocodeEdit() {
   if (debounceTimerEdit) clearTimeout(debounceTimerEdit)
@@ -196,14 +291,14 @@ async function geocodeEditAddress() {
         showToast('Location not found', 'error')
       }
     }
-  } catch (err) {
+  } catch (err: any) {
     console.error('Geocoding failed:', err)
   } finally {
     isGeocodingEdit.value = false
   }
 }
 
-async function reverseGeocodeEdit(lat, lng) {
+async function reverseGeocodeEdit(lat: number, lng: number) {
   isGeocodingEdit.value = true
   try {
      const res = await fetch(`${API_URL}/reverse-geocode?lat=${lat}&lon=${lng}`)
@@ -218,7 +313,7 @@ async function reverseGeocodeEdit(lat, lng) {
   }
 }
 
-function updateEditMapLocation(lat, lng, triggerReverse = true) {
+function updateEditMapLocation(lat: number, lng: number, triggerReverse = true) {
   editSchoolForm.value.latitude = lat
   editSchoolForm.value.longitude = lng
   
@@ -228,7 +323,7 @@ function updateEditMapLocation(lat, lng, triggerReverse = true) {
     if (markerInstanceEdit) markerInstanceEdit.remove()
     markerInstanceEdit = L.marker([lat, lng], { draggable: true }).addTo(mapInstanceEdit)
     
-    markerInstanceEdit.on('dragend', async (e) => {
+    markerInstanceEdit.on('dragend', async (e: any) => {
       const { lat, lng } = e.target.getLatLng()
       editSchoolForm.value.latitude = lat
       editSchoolForm.value.longitude = lng
@@ -267,7 +362,7 @@ async function initEditMap() {
   if (editSchoolForm.value.latitude && editSchoolForm.value.longitude) {
     markerInstanceEdit = L.marker([lat, lng], { draggable: true }).addTo(mapInstanceEdit)
     
-    markerInstanceEdit.on('dragend', async (e) => {
+    markerInstanceEdit.on('dragend', async (e: any) => {
       const { lat, lng } = e.target.getLatLng()
       editSchoolForm.value.latitude = lat
       editSchoolForm.value.longitude = lng
@@ -276,14 +371,14 @@ async function initEditMap() {
   }
 
   // Map click to set location
-  mapInstanceEdit.on('click', (e) => {
+  mapInstanceEdit.on('click', (e: any) => {
     const { lat, lng } = e.latlng
     // Trigger reverse geocode on click
     updateEditMapLocation(lat, lng, true)
   })
 }
 
-watch(isEditingSchool, (val) => {
+watch(isEditingSchool, (val: boolean) => {
   if (val) {
     initEditMap()
   } else {
@@ -295,43 +390,30 @@ watch(isEditingSchool, (val) => {
 })
 
 // Permit CRUD
-function openEditPermit(permit) {
+// Permit CRUD
+function openEditPermit(permit: Permit) {
   editPermitForm.value = { 
-    ...permit,
-    // Ensure levels is array
-    levels: Array.isArray(permit.levels) ? permit.levels : [],
-    // For file upload
+    schoolId: permit.schoolId || permit.school_id || '',
+    levels: Array.isArray(permit.levels) ? [...permit.levels] : [],
+    schoolYear: permit.schoolYear || '',
+    permitNumber: permit.permitNumber || '',
     file: null,
     fileName: permit.fileName || '',
-    filePreviewUrl: permit.filePreviewUrl
+    filePreviewUrl: permit.filePreviewUrl,
+    extractedText: permit.extractedText || '',
+    strands: permit.strands || []
   }
+  // We need to keep the original ID for saving
+  ;(editPermitForm.value as any).id = permit.id
   isEditingPermit.value = true
-}
-
-async function deletePermit(permitId) {
-  const confirmed = await confirmAction('Are you sure you want to delete this permit?')
-  if (!confirmed) return
-  
-  try {
-    const res = await fetch(`${API_URL}/permits/${permitId}`, { method: 'DELETE' })
-    if (res.ok) {
-      showToast('Permit deleted successfully', 'success')
-      refreshData()
-      triggerTrashAnim()
-    } else {
-      throw new Error('Failed to delete')
-    }
-  } catch (err) {
-    showToast('Failed to delete permit', 'error')
-  }
 }
 
 async function saveEditPermit() {
   const formData = new FormData()
-  formData.append('schoolId', editPermitForm.value.schoolId)
-  formData.append('levels', JSON.stringify(editPermitForm.value.levels))
-  formData.append('schoolYear', editPermitForm.value.schoolYear)
-  formData.append('permitNumber', editPermitForm.value.permitNumber)
+  formData.append('schoolId', editPermitForm.value.schoolId || '')
+  formData.append('levels', JSON.stringify(editPermitForm.value.levels || []))
+  formData.append('schoolYear', editPermitForm.value.schoolYear || '')
+  formData.append('permitNumber', editPermitForm.value.permitNumber || '')
   formData.append('extractedText', editPermitForm.value.extractedText || '')
   
   if (editPermitForm.value.file) {
@@ -339,7 +421,7 @@ async function saveEditPermit() {
   }
   
   try {
-    const res = await fetch(`${API_URL}/permits/${editPermitForm.value.id}`, {
+    const res = await fetch(`${API_URL}/permits/${(editPermitForm.value as any).id}`, {
       method: 'PUT',
       body: formData
     })
@@ -351,26 +433,58 @@ async function saveEditPermit() {
     } else {
       throw new Error('Failed to update')
     }
-  } catch (err) {
+  } catch (err: any) {
     showToast('Failed to update permit', 'error')
   }
 }
 
-function onEditPermitFileChange(e) {
-  const file = e.target.files?.[0]
+function onEditPermitFileChange(e: Event) {
+  const target = e.target as HTMLInputElement
+  const file = target.files?.[0]
   if (!file) return
   editPermitForm.value.file = file
   editPermitForm.value.fileName = file.name
 }
 
-function toggleEditPermitLevel(value) {
-  const i = editPermitForm.value.levels.indexOf(value)
-  if (i >= 0) editPermitForm.value.levels.splice(i, 1)
-  else editPermitForm.value.levels.push(value)
+function toggleEditPermitLevel(value: string) {
+  if (!editPermitForm.value.levels) {
+    editPermitForm.value.levels = []
+  }
+  const levels = editPermitForm.value.levels
+  const i = levels.indexOf(value)
+  if (i >= 0) levels.splice(i, 1)
+  else levels.push(value)
+}
+
+interface PermitFormItem {
+  permitNumber: string;
+  schoolYear: string;
+  levels: string[];
+  strands: string[];
+}
+
+interface SchoolForm {
+  name: string;
+  type: string;
+  address: string;
+  fileName: string;
+  file: File | null;
+  filePreviewUrl: string | null;
+  ocrLoading: boolean;
+  ocrConfidence: number;
+  ocrErrors: string[];
+  levels: string[];
+  schoolYear: string;
+  permitNumber: string;
+  strands: string[];
+  extractedText: string;
+  permits: PermitFormItem[];
+  latitude: number | null;
+  longitude: number | null;
 }
 
 // ─── Create New School ──────────────────────────────────────────────────────
-const schoolForm = ref({
+const schoolForm = ref<SchoolForm>({
   name: '',
   type: 'Private', // Default to Private
   address: '',
@@ -386,36 +500,39 @@ const schoolForm = ref({
   permitNumber: '',
   strands: [],
   extractedText: '',
-  permits: [{ permitNumber: '', schoolYear: '', levels: [], strands: [] }]
+  permits: [{ permitNumber: '', schoolYear: '', levels: [], strands: [] }],
+  latitude: null,
+  longitude: null
 })
-const schoolFormErrors = ref({})
+const schoolFormErrors = ref<Record<string, string>>({})
 
 // Address Input Sanitization (keep numbers and basic punctuation for accurate geocoding)
-function sanitizeAddressString(input) {
+function sanitizeAddressString(input: string | null | undefined) {
   if (!input) return ''
   // Allow letters, numbers, spaces, and common address punctuation
   return input.replace(/[^a-zA-Z0-9\s.,#\-\/()]/g, '')
 }
 
-function sanitizeAddressInput(e) {
-  const input = e.target.value
+function sanitizeAddressInput(e: Event) {
+  const target = e.target as HTMLInputElement
+  const input = target.value
   const sanitized = sanitizeAddressString(input)
   
   // Update if changed
   if (input !== sanitized) {
     schoolForm.value.address = sanitized
     // Force DOM update to reflect sanitized value immediately
-    e.target.value = sanitized
+    target.value = sanitized
   }
 }
 
 // ─── Leaflet Map Logic ────────────────────────────────────────────────────────
-const mapContainer = ref(null)
-const mapInstance = ref(null)
-const mapMarker = ref(null)
+const mapContainer = ref<HTMLElement | null>(null)
+const mapInstance = ref<L.Map | null>(null)
+const mapMarker = ref<L.Marker | null>(null)
 const isGeocoding = ref(false)
 const geocodeError = ref('')
-let debounceTimer = null
+let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
 function initMap() {
   if (!mapContainer.value || mapInstance.value) return
@@ -426,33 +543,33 @@ function initMap() {
   
   // Use local proxy to bypass client-side blocking of OSM tiles
   // Endpoint changed to /maps/proxy to avoid ad-blocker keywords
-  const tiles = L.tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, {
+  const tiles = (L as any).tileLayer(`${API_URL}/maps/proxy/{z}/{x}/{y}`, {
     maxZoom: 19,
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
   })
   
-  tiles.on('tileerror', (error) => {
+  tiles.on('tileerror', (error: any) => {
     console.warn('Map tile failed to load:', error)
   })
   
-  tiles.addTo(mapInstance.value)
+  tiles.addTo(mapInstance.value as L.Map)
 
   // Manual Pinning with Reverse Geocoding
-  mapInstance.value.on('click', async (e) => {
+  (mapInstance.value as L.Map).on('click', async (e: any) => {
      const { lat, lng } = e.latlng
      await handleManualPin(lat, lng)
   })
 }
 
-async function handleManualPin(lat, lng) {
+async function handleManualPin(lat: number, lng: number) {
   // 1. Update Marker immediately for responsiveness
   if (mapMarker.value) {
       mapMarker.value.setLatLng([lat, lng])
   } else {
-      mapMarker.value = L.marker([lat, lng], { draggable: true }).addTo(mapInstance.value)
+      mapMarker.value = (L as any).marker([lat, lng], { draggable: true }).addTo(mapInstance.value as L.Map)
       
       // Allow dragging the marker to refine position
-      mapMarker.value.on('dragend', async (event) => {
+      (mapMarker.value as any).on('dragend', async (event: any) => {
         const pos = event.target.getLatLng()
         await handleManualPin(pos.lat, pos.lng)
       })
@@ -500,20 +617,19 @@ async function updateMapFromAddress() {
       if (mapMarker.value) {
           mapMarker.value.setLatLng([lat, lng])
       } else {
-          mapMarker.value = L.marker([lat, lng]).addTo(mapInstance.value)
+          mapMarker.value = L.marker([lat, lng]).addTo(mapInstance.value as L.Map)
       }
       
-      mapInstance.value.setView([lat, lng], 16)
+      (mapInstance.value as L.Map).setView([lat, lng], 16)
       
       // Sync form with geocoded result
       schoolForm.value.latitude = lat
       schoolForm.value.longitude = lng
     } else {
-      // Don't remove marker immediately if user is just typing, but maybe warn?
       // Actually requirement says: "If geocoding fails, do not place a marker; Display a clear error"
       geocodeError.value = 'Address not found on map'
-      if (mapMarker.value) {
-        mapInstance.value.removeLayer(mapMarker.value)
+      if (mapMarker.value && mapInstance.value) {
+        (mapInstance.value as any).removeLayer(mapMarker.value as any)
         mapMarker.value = null
         schoolForm.value.latitude = null
         schoolForm.value.longitude = null
@@ -528,7 +644,7 @@ async function updateMapFromAddress() {
 }
 
 // Watch address change with debounce
-watch(() => schoolForm.value.address, (newVal) => {
+watch(() => schoolForm.value.address, (newVal: string) => {
   if (!newVal) return
   if (debounceTimer) clearTimeout(debounceTimer)
   debounceTimer = setTimeout(() => {
@@ -537,11 +653,11 @@ watch(() => schoolForm.value.address, (newVal) => {
 })
 
 // Watch view change to init map when Registration tab opens
-watch(currentView, async (newVal) => {
-  if (newVal === 'registration') {
+watch(currentView, async (newVal: string) => {
+  if (newVal === 'registration' as any) {
     // Reset map instance if it exists but container is new (should rely on cleanup, but just in case)
     if (mapInstance.value) {
-       mapInstance.value.remove()
+       (mapInstance.value as L.Map).remove()
        mapInstance.value = null
        mapMarker.value = null
     }
@@ -558,7 +674,7 @@ watch(currentView, async (newVal) => {
   } else {
     // Cleanup map when leaving registration view
     if (mapInstance.value) {
-       mapInstance.value.remove()
+       (mapInstance.value as L.Map).remove()
        mapInstance.value = null
        mapMarker.value = null
     }
@@ -572,17 +688,17 @@ onMounted(async () => {
 const searchQuery = ref('')
 const rawSearchInput = ref('')
 const isSearching = ref(false)
-let searchTimeout = null
+let searchTimeout: ReturnType<typeof setTimeout> | null = null
 const searchError = ref('')
 
-function isValidSearchInput(str) {
+function isValidSearchInput(str: string) {
   if (!str) return true
   if (str.length > 100) return false
   // Allow letters, numbers, spaces, period, comma, apostrophe, hyphen, ampersand
   return /^[a-zA-Z0-9\s.,'&-]+$/.test(str)
 }
 
-watch(rawSearchInput, (newVal) => {
+watch(rawSearchInput, (newVal: string) => {
   isSearching.value = true
   if (searchTimeout) clearTimeout(searchTimeout)
   searchTimeout = setTimeout(() => {
@@ -601,19 +717,19 @@ watch(rawSearchInput, (newVal) => {
 // Confirmation state handling is unified at the bottom of the script
 
 // ─── Map Logic for Admin View ──────────────────────────────────────────────────────────────
-const selectedSchool = ref(null)
+const selectedSchool = ref<GroupedSchool | null>(null)
 
-const mapContainerView = ref(null)
-let mapInstanceView = null
-let markerInstanceView = null
+const mapContainerView = ref<HTMLElement | null>(null)
+let mapInstanceView: L.Map | null = null
+let markerInstanceView: L.Marker | null = null
 
 // New Map for Details Modal
-const mapContainerDetails = ref(null)
-let mapInstanceDetails = null
-let markerInstanceDetails = null
+const mapContainerDetails = ref<HTMLElement | null>(null)
+let mapInstanceDetails: L.Map | null = null
+let markerInstanceDetails: L.Marker | null = null
 
 // Watch selected school to update maps
-watch(selectedSchool, async (school) => {
+watch(selectedSchool, async (school: GroupedSchool | null) => {
   if (!school) {
      if (mapInstanceView) {
         mapInstanceView.remove()
@@ -679,11 +795,10 @@ watch(selectedSchool, async (school) => {
   }
 })
 
-function selectSchool(id) {
-  const group = searchResults.value.find(g => g.schoolId === id)
+function selectSchool(id: string) {
+  const group = searchResults.value.find((g: GroupedSchool) => g.schoolId === id)
   if (group) {
     selectedSchool.value = group
-    // isMapModalOpen.value = true // Disable separate map modal to show combined view
     showDetailsModal.value = false
   }
 }
@@ -691,8 +806,8 @@ function selectSchool(id) {
 // ─── Map Modal Logic ─────────────────────────────────────────────────────────
 const isMapModalOpen = ref(false)
 const showDetailsModal = ref(false)
-const mapModalContainer = ref(null)
-let mapModalInstance = null
+const mapModalContainer = ref<HTMLElement | null>(null)
+let mapModalInstance: L.Map | null = null
 
 function closeMapModal() {
   isMapModalOpen.value = false
@@ -707,7 +822,7 @@ function openDetailsFromMap() {
   showDetailsModal.value = true
 }
 
-watch(isMapModalOpen, async (isOpen) => {
+watch(isMapModalOpen, async (isOpen: boolean) => {
   if (isOpen && selectedSchool.value) {
     await nextTick()
     initModalMap()
@@ -767,43 +882,50 @@ const levelOptions = [
 ]
 
 // ─── Trash Bin Logic ─────────────────────────────────────────────────────────
-const trashSchools = ref([])
-const trashPermits = ref([])
+const trashSchools = ref<School[]>([])
+const trashPermits = ref<Permit[]>([])
 const trashLoading = ref(false)
 const trashAnimating = ref(false)
 
-const unifiedTrash = computed(() => {
-  const schoolIds = new Set(trashSchools.value.map(s => s.id))
+const unifiedTrash = computed<TrashItem[]>(() => {
+  const schoolIds = new Set(trashSchools.value.map((s: School) => s.id))
   
-  const displaySchools = trashSchools.value.map(s => ({
-    id: s.id,
-    type: 'school',
-    title: s.name,
-    subtitle: s.address,
-    deletedAt: s.deletedAt,
-    badgeColor: 'bg-purple-100 text-purple-700',
-    icon: 'School' // We'll render icon dynamically if needed, or just use badge
-  }))
+  const displaySchools = trashSchools.value.map((s: School) => {
+    const item: TrashItem = {
+      id: s.id,
+      type: 'school' as const,
+      title: s.name,
+      subtitle: s.address,
+      deletedAt: s.deletedAt || '',
+      badgeColor: 'bg-purple-100 text-purple-700'
+    }
+    return item
+  })
   
   const displayPermits = trashPermits.value
-    .filter(p => !schoolIds.has(p.schoolId))
-    .map(p => ({
-      id: p.id,
-      type: 'permit',
-      title: getSchoolName(p.schoolId),
-      subtitle: `Permit No: ${p.permitNumber} (SY ${p.schoolYear})`,
-      deletedAt: p.deletedAt,
-      badgeColor: 'bg-blue-100 text-blue-700'
-    }))
+    .filter((p: Permit) => !schoolIds.has(p.schoolId || p.school_id || ''))
+    .map((p: Permit) => {
+      const item: TrashItem = {
+        id: p.id,
+        type: 'permit' as const,
+        title: getSchoolName(p.schoolId || p.school_id || ''),
+        subtitle: `Permit No: ${p.permitNumber} (SY ${p.schoolYear})`,
+        deletedAt: p.deletedAt || '',
+        badgeColor: 'bg-blue-100 text-blue-700'
+      }
+      return item
+    })
     
-  return [...displaySchools, ...displayPermits].sort((a, b) => 
-    new Date(b.deletedAt) - new Date(a.deletedAt)
-  )
+  return [...displaySchools, ...displayPermits].sort((a: TrashItem, b: TrashItem) => {
+    const timeA = a.deletedAt ? new Date(a.deletedAt).getTime() : 0
+    const timeB = b.deletedAt ? new Date(b.deletedAt).getTime() : 0
+    return timeB - timeA
+  })
 })
 
 const trashCount = computed(() => unifiedTrash.value.length)
 
-watch(currentView, (newVal) => {
+watch(currentView, (newVal: string) => {
   if (newVal === 'trash') fetchTrash()
 })
 
@@ -816,7 +938,7 @@ async function fetchTrash() {
       trashSchools.value = data.schools || []
       trashPermits.value = data.permits || []
     }
-  } catch (err) {
+  } catch (err: any) {
     console.error('Failed to fetch trash:', err)
   } finally {
     trashLoading.value = false
@@ -830,25 +952,25 @@ function triggerTrashAnim() {
   }, 1000)
 }
 
-function getSchoolName(schoolId) {
+function getSchoolName(schoolId: string) {
   // Check active schools
-  const active = schools.value.find(s => s.id === schoolId)
+  const active = schools.value.find((s: School) => s.id === schoolId)
   if (active) return active.name
   // Check trash schools
-  const trash = trashSchools.value.find(s => s.id === schoolId)
+  const trash = trashSchools.value.find((s: School) => s.id === schoolId)
   if (trash) return trash.name + ' (Deleted)'
   return 'Unknown School'
 }
 
-function getSchoolAddress(schoolId) {
-  const active = schools.value.find(s => s.id === schoolId)
+function getSchoolAddress(schoolId: string) {
+  const active = schools.value.find((s: School) => s.id === schoolId)
   if (active) return active.address
-  const trash = trashSchools.value.find(s => s.id === schoolId)
+  const trash = trashSchools.value.find((s: School) => s.id === schoolId)
   if (trash) return trash.address
   return ''
 }
 
-async function restoreItem(type, id) {
+async function restoreItem(type: 'school' | 'permit', id: string) {
   try {
     const res = await fetch(`${API_URL}/restore/${type}/${id}`, { method: 'POST' })
     if (res.ok) {
@@ -858,12 +980,12 @@ async function restoreItem(type, id) {
     } else {
       throw new Error('Failed to restore')
     }
-  } catch (err) {
+  } catch (err: any) {
     showToast('Failed to restore item', 'error')
   }
 }
 
-async function deleteForever(type, id) {
+async function deleteForever(type: 'school' | 'permit', id: string) {
   const confirmed = await confirmAction('Are you sure? This action cannot be undone.')
   if (!confirmed) return
 
@@ -875,15 +997,15 @@ async function deleteForever(type, id) {
     } else {
       throw new Error('Failed to delete')
     }
-  } catch (err) {
+  } catch (err: any) {
     showToast('Failed to delete item', 'error')
   }
 }
 
-const createTab = ref('school') // 'school' | 'homeschool'
+const createTab = ref<string>('school') // 'school' | 'homeschool'
 
 // ─── Image Preprocessing Helpers ───
-function applyImageEnhancement(ctx, width, height) {
+function applyImageEnhancement(ctx: CanvasRenderingContext2D, width: number, height: number) {
   // 1. Get image data
   const imageData = ctx.getImageData(0, 0, width, height)
   const data = imageData.data
@@ -913,7 +1035,7 @@ function applyImageEnhancement(ctx, width, height) {
       const idx = (y * width + x) * 4
       
       // Collect 3x3 window
-      const window = []
+      const window: number[] = []
       for (let ky = -1; ky <= 1; ky++) {
         for (let kx = -1; kx <= 1; kx++) {
           const nIdx = ((y + ky) * width + (x + kx)) * 4
@@ -935,26 +1057,33 @@ function applyImageEnhancement(ctx, width, height) {
   ctx.putImageData(imageData, 0, 0)
 }
 
-async function preprocessImage(file) {
+async function preprocessImage(file: File): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const img = new Image()
     img.onload = () => {
       const canvas = document.createElement('canvas')
       const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('Failed to get canvas context'))
+        return
+      }
       canvas.width = img.width
       canvas.height = img.height
       ctx.drawImage(img, 0, 0)
       
       applyImageEnhancement(ctx, canvas.width, canvas.height)
       
-      canvas.toBlob((blob) => resolve(blob), file.type)
+      canvas.toBlob((blob) => {
+        if (blob) resolve(blob)
+        else reject(new Error('Failed to create blob'))
+      }, file.type)
     }
     img.onerror = reject
     img.src = URL.createObjectURL(file)
   })
 }
 
-async function rotateBlob(blob, angle) {
+async function rotateBlob(blob: Blob, angle: number): Promise<Blob> {
   const img = new Image()
   const url = URL.createObjectURL(blob)
   img.src = url
@@ -963,41 +1092,48 @@ async function rotateBlob(blob, angle) {
   
   const canvas = document.createElement('canvas')
   const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Failed to get canvas context')
   
   // Swap dimensions for 90/270 degrees
-  if (Math.abs(angle) % 180 === 90) {
+  if (angle % 180 !== 0) {
     canvas.width = img.height
     canvas.height = img.width
   } else {
     canvas.width = img.width
     canvas.height = img.height
   }
-  
+
   ctx.translate(canvas.width / 2, canvas.height / 2)
-  ctx.rotate(angle * Math.PI / 180)
+  ctx.rotate((angle * Math.PI) / 180)
   ctx.drawImage(img, -img.width / 2, -img.height / 2)
-  
-  return new Promise(resolve => canvas.toBlob(resolve, blob.type))
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((newBlob) => {
+      if (newBlob) resolve(newBlob)
+      else reject(new Error('Rotation failed'))
+    }, blob.type)
+  })
 }
 
-async function rotateImage(direction) {
+async function rotateImage(direction: number) {
   if (!schoolForm.value.file || !schoolForm.value.file.type.startsWith('image/')) return
   
   try {
     const blob = await rotateBlob(schoolForm.value.file, direction)
-    const newFile = new File([blob], schoolForm.value.fileName, { type: schoolForm.value.file.type })
+    const newFile = new File([blob], schoolForm.value.fileName, { type: schoolForm.value.file!.type })
     processSchoolFile(newFile)
   } catch (err) {
     console.error('Rotation failed:', err)
   }
 }
 
-async function detectOrientation(imageBlob) {
+async function detectOrientation(imageBlob: Blob): Promise<number> {
   try {
     // Use OSD mode (psm: 0) to detect orientation
-    const { data } = await Tesseract.recognize(imageBlob, 'osd', {
-      logger: m => {} 
+    const result = await Tesseract.recognize(imageBlob, 'osd', {
+      logger: (m: any) => {} 
     })
+    const data = result.data as any
     
     // Tesseract OSD returns orientation_degrees (angle to rotate to be upright)
     // and confidence.
@@ -1011,7 +1147,7 @@ async function detectOrientation(imageBlob) {
   }
 }
 
-async function processSchoolFile(file) {
+async function processSchoolFile(file: File) {
   if (schoolForm.value.filePreviewUrl) URL.revokeObjectURL(schoolForm.value.filePreviewUrl)
   schoolForm.value.file = file
   schoolForm.value.filePreviewUrl = URL.createObjectURL(file)
@@ -1029,14 +1165,14 @@ async function processSchoolFile(file) {
          console.log(`Auto-rotating image by ${angle} degrees`)
          processedBlob = await rotateBlob(processedBlob, angle)
          // Update preview with rotated image
-         URL.revokeObjectURL(schoolForm.value.filePreviewUrl)
+         if (schoolForm.value.filePreviewUrl) URL.revokeObjectURL(schoolForm.value.filePreviewUrl)
          schoolForm.value.filePreviewUrl = URL.createObjectURL(processedBlob)
          // Update stored file so manual rotation works on the new orientation
          schoolForm.value.file = new File([processedBlob], file.name, { type: file.type })
       }
       
-      const { data } = await Tesseract.recognize(processedBlob, 'eng+fil')
-      text = data.text
+      const result = await Tesseract.recognize(processedBlob, 'eng+fil')
+      text = result.data.text
     } else if (file.type === 'application/pdf') {
        // Robust PDF text extract
       const buf = await file.arrayBuffer()
@@ -1046,7 +1182,7 @@ async function processSchoolFile(file) {
        for (let i = 1; i <= maxPages; i++) {
          const page = await pdf.getPage(i)
          const content = await page.getTextContent()
-         const rawText = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
+         const rawText = content.items.map((it: any) => ('str' in it ? it.str : '')).join(' ')
          let pageText = rawText
          
          const normalized = rawText.replace(/\s/g, '')
@@ -1057,17 +1193,21 @@ async function processSchoolFile(file) {
               const viewport = page.getViewport({ scale: 2.0 })
               const canvas = document.createElement('canvas')
               const context = canvas.getContext('2d')
-              canvas.height = viewport.height
-              canvas.width = viewport.width
-              await page.render({ canvasContext: context, viewport: viewport }).promise
-              
-              applyImageEnhancement(context, viewport.width, viewport.height)
-              
-              const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))
-              const { data } = await Tesseract.recognize(blob, 'eng+fil')
-              const ocrText = data.text || ''
-              if (ocrText.replace(/\s/g, '').length > normalized.length) {
-                pageText = ocrText
+              if (context) {
+                canvas.height = viewport.height
+                canvas.width = viewport.width
+                await (page as any).render({ canvasContext: context, viewport: viewport }).promise
+                
+                applyImageEnhancement(context, viewport.width, viewport.height)
+                
+                const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/png'))
+                if (blob) {
+                  const { data } = await Tesseract.recognize(blob, 'eng+fil')
+                  const ocrText = data.text || ''
+                  if (ocrText.replace(/\s/g, '').length > normalized.length) {
+                    pageText = ocrText
+                  }
+                }
               }
             } catch (ocrErr) {
               console.error('Page OCR failed:', ocrErr)
@@ -1146,7 +1286,7 @@ async function processSchoolFile(file) {
       showToast('School info scanned. No permits detected.', 'info')
     }
 
-  } catch (err) {
+  } catch (err: any) {
     console.error('File Processing Error:', err)
     let msg = 'Failed to scan file'
     if (err.message) msg += `: ${err.message}`
@@ -1162,13 +1302,14 @@ function verifyScan() {
   showToast('Marked as verified', 'success')
 }
 
-async function onSchoolFileChange(e) {
-  const file = e.target.files?.[0]
+async function onSchoolFileChange(e: Event) {
+  const target = e.target as HTMLInputElement
+  const file = target.files?.[0]
   if (!file) return
-  processSchoolFile(file)
+  processSchoolFile(file);
 }
 
-function setCreateTab(tab) {
+function setCreateTab(tab: string) {
   createTab.value = tab
   schoolFormErrors.value = {}
   
@@ -1181,8 +1322,14 @@ function setCreateTab(tab) {
     fileName: '',
     filePreviewUrl: null,
     ocrLoading: false,
+    ocrConfidence: 100,
+    ocrErrors: [],
+    levels: [],
+    schoolYear: '',
+    permitNumber: '',
+    strands: [],
     extractedText: '',
-    permits: [] // Array of { permitNumber, schoolYear, levels, strands }
+    permits: [] as PermitFormItem[] // Array of { permitNumber, schoolYear, levels, strands }
   }
 
   if (tab === 'homeschool') {
@@ -1203,23 +1350,15 @@ function setCreateTab(tab) {
 }
 
 // ─── Manage Records (Permits / Applications) ────────────────────────────────
-const manageTab = ref('permit') // 'permit' | 'application'
+const manageTab = ref<string>('permit') // 'permit' | 'application'
 
-const schoolOptions = computed(() => {
-  return schools.value.filter(s => s.type !== 'Homeschooling')
-})
-
-const homeschoolOptions = computed(() => {
-  return schools.value.filter(s => s.type === 'Homeschooling')
-})
-
-function setManageTab(tab) {
+function setManageTab(tab: string) {
   manageTab.value = tab
   resetPermitForm()
 }
 
 function validateSchoolForm() {
-  const err = {}
+  const err: Record<string, string> = {}
   if (!schoolForm.value.name?.trim()) err.name = 'School name is required'
   if (!schoolForm.value.type) err.type = 'School type is required'
   schoolFormErrors.value = err
@@ -1231,10 +1370,10 @@ async function createSchool() {
   
   // Check for duplicate school name, allow exception if address is different (branch)
   const normalizedName = schoolForm.value.name.trim().toLowerCase()
-  const sameNameSchools = schools.value.filter(s => s.name.trim().toLowerCase() === normalizedName)
+  const sameNameSchools = schools.value.filter((s: School) => s.name.trim().toLowerCase() === normalizedName)
   if (sameNameSchools.length > 0) {
     const newAddr = (schoolForm.value.address ?? '').trim().toLowerCase()
-    const exactAddressMatch = sameNameSchools.find(s => (s.address ?? '').trim().toLowerCase() === newAddr)
+    const exactAddressMatch = sameNameSchools.find((s: School) => (s.address ?? '').trim().toLowerCase() === newAddr)
     if (exactAddressMatch) {
       showToast(`School "${schoolForm.value.name}" at this address already exists`, 'error')
       return
@@ -1325,12 +1464,18 @@ async function createSchool() {
         fileName: '',
         filePreviewUrl: null,
         ocrLoading: false,
+        ocrConfidence: 100,
+        ocrErrors: [],
+        levels: [],
+        schoolYear: '',
+        permitNumber: '',
+        strands: [],
         permits: [{ permitNumber: '', schoolYear: '', levels: [], strands: [] }]
       }
       
       // Clear map marker
-      if (mapMarker.value) {
-         mapInstance.value?.removeLayer(mapMarker.value)
+      if (mapMarker.value && mapInstance.value) {
+         (mapInstance.value as any).removeLayer(mapMarker.value as any)
          mapMarker.value = null
       }
       if (mapInstance.value) {
@@ -1342,14 +1487,14 @@ async function createSchool() {
       const errData = await res.json().catch(() => ({}))
       throw new Error(errData.error || 'Failed to create school')
     }
-  } catch (error) {
+  } catch (error: any) {
     console.error(error)
     showToast(error.message || 'Error creating school', 'error')
   }
 }
 
 // ─── Upload Permit (with OCR for permit number) ──────────────────────────────
-const permitForm = ref({
+const permitForm = ref<PermitForm>({
   schoolId: '',
   levels: [],
   schoolYear: '',
@@ -1357,20 +1502,26 @@ const permitForm = ref({
   filePreviewUrl: null,
   permitNumber: '',
   fileName: '',
+  extractedText: '',
+  strands: []
 })
-const permitFormErrors = ref({})
+const permitFormErrors = ref<Record<string, string>>({})
 const ocrLoading = ref(false)
 
 // ─── Toast Notification ─────────────────────────────────────────────────────
-const toast = ref({
+const toast = ref<{
+  show: boolean;
+  message: string;
+  type: 'success' | 'error' | 'info';
+}>({
   show: false,
   message: '',
-  type: 'success' // 'success' | 'error'
+  type: 'success'
 })
 
-let toastTimeout = null
+let toastTimeout: ReturnType<typeof setTimeout> | null = null
 
-function showToast(message, type = 'success') {
+function showToast(message: string, type: 'success' | 'error' | 'info' = 'success') {
   toast.value = { show: true, message, type }
   
   if (toastTimeout) clearTimeout(toastTimeout)
@@ -1380,216 +1531,28 @@ function showToast(message, type = 'success') {
 }
 
 /** Extract multiple permit details from OCR text */
-function extractPermitDetails_UNUSED(text) {
-  if (!text || typeof text !== 'string' || !text.trim()) return []
-  
-  // 1. Pre-process: Normalize whitespace and fix common OCR typos in keywords
-  let t = text.replace(/\s+/g, ' ').trim()
-  
-  // Fuzzy replacements for key terms
-  const replacements = [
-    { pattern: /G[o0]vern?ment\s+P[e3]rmit/gi, replacement: 'Government Permit' },
-    { pattern: /G[o0]vern?ment\s+Rec[o0]gni[t7]ion/gi, replacement: 'Government Recognition' },
-    { pattern: /DepEd\s+P[e3]rmit/gi, 'replacement': 'Government Permit' },
-    { pattern: /Auth[o0]rity\s+to\s+Operate/gi, replacement: 'Authority to Operate' },
-    { pattern: /Provi[s5]ional\s+P[e3]rmit/gi, replacement: 'Provisional Permit' },
-    { pattern: /s\.\s*(\d{4})/gi, replacement: 's. $1' }, // Ensure space after s.
-    { pattern: /series\s+of/gi, replacement: 's.' },
-    { pattern: /dated/gi, replacement: 's.' } // Treat "dated" as "s." for parsing
-  ]
-  
-  replacements.forEach(({ pattern, replacement }) => {
-    t = t.replace(pattern, replacement)
-  })
-  
-  console.log('Extracted Text (Normalized):', t)
-  const permits = []
 
-  // Helper: Detect Strands (Full names & Abbreviations)
-  const detectStrands = (txt) => {
-    const found = []
-    
-    // STEM
-    if (/STEM|Science,? Technology,? Engineering,? (?:and|&) Mathematics|Science\s+and\s+Technology/i.test(txt)) {
-       if (!found.includes('STEM')) found.push('STEM')
-    }
-    
-    // ABM
-    if (/ABM|Accountancy,? Business,? (?:and|&) Management|Business\s+and\s+Management/i.test(txt)) {
-       if (!found.includes('ABM')) found.push('ABM')
-    }
-    
-    // HUMSS
-    if (/HUMSS|Humanities (?:and|&) Social Sciences|Humanities/i.test(txt)) {
-       if (!found.includes('HUMSS')) found.push('HUMSS')
-    }
-    
-    // GAS
-    if (/GAS|General Academic/i.test(txt)) {
-       if (!found.includes('GAS')) found.push('GAS')
-    }
-    
-    // TVL & Specializations
-    const tvlKeywords = [
-       'TVL', 
-       'Technical[- ]Vocational[- ]Livelihood',
-       'Tech[- ]Voc',
-       'ICT', 'Information and Communications Technology', 'Computer Systems Servicing', 'Programming', 'Animation',
-       'Home Economics', 'HE', 'Cookery', 'Bread and Pastry', 'Food and Beverage', 'Housekeeping', 'Caregiving', 'Dressmaking', 'Tailoring', 'Wellness Massage',
-       'Agri-Fishery', 'AFA', 'Agriculture', 'Fishery',
-       'Industrial Arts', 'IA', 'Automotive', 'Welding', 'Electrical Installation', 'Electronics', 'Carpentry', 'Plumbing', 'Shielded Metal Arc'
-    ]
-    const tvlRegex = new RegExp(tvlKeywords.join('|'), 'i')
-    if (tvlRegex.test(txt)) {
-       if (!found.includes('TVL')) found.push('TVL')
-    }
-    
-    // Sports
-    if (/Sports/i.test(txt)) {
-       if (!found.includes('Sports')) found.push('Sports')
-    }
-    
-    // Arts and Design
-    if (/Arts (?:and|&) Design|Design/i.test(txt)) {
-       if (!found.includes('Arts and Design')) found.push('Arts and Design')
-    }
-    
-    return found
-  }
-  
-  // Helper: Clean Permit Number
-  const cleanPermitNumber = (raw) => {
-      // Remove trailing punctuation
-      let clean = raw.replace(/[.,:;]+$/, '').trim()
-      // Fix common char swaps in numbers (O -> 0, l/I -> 1) if mixed
-      // Only apply if it looks like it should be alphanumeric (e.g., "SHS-O89" -> "SHS-089")
-      if (/[A-Z]+-\w+/.test(clean)) {
-          const parts = clean.split('-')
-          if (parts.length > 1) {
-              // Usually the second part is numeric
-              parts[1] = parts[1].replace(/O/g, '0').replace(/[lI]/g, '1')
-              clean = parts.join('-')
-          }
-      }
-      return clean
-  }
-
-  // Strategy 1: Strong "Keyword ... No. ... s. Year" Pattern
-  // Matches: "Government Permit (R-IVA) No. SHS-089 s. 2018"
-  const strongRegex = /(?:Government\s+Permit|Government\s+Recognition|Authority\s+to\s+Operate|Provisional\s+Permit)(?:\s*\(.*?\))?[\s:.]+(?:No\.?|Number)?[\s:.]*([A-Z0-9\s-]+?)[\s,.]+(?:s\.)\s*(\d{4}(?:[-]\d{4})?)/gi
-  
-  let match
-  while ((match = strongRegex.exec(t)) !== null) {
-    let pNum = cleanPermitNumber(match[1])
-    let sYear = match[2].trim()
-    
-    // Validation: Permit number shouldn't be too long or contain too many spaces
-    if (pNum.length > 30 || (pNum.match(/\s/g) || []).length > 3) continue
-    
-    const levels = []
-    let strands = []
-    
-    // Infer Level from Permit Number Prefix
-    if (/^K[-]/i.test(pNum) || /Kindergarten/i.test(pNum)) levels.push('Kindergarten')
-    else if (/^E[-]/i.test(pNum) || /Elementary/i.test(pNum)) levels.push('Elementary')
-    else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum) || /Junior/i.test(pNum)) levels.push('Junior High School') 
-    else if (/^SHS[-]/i.test(pNum) || /Senior/i.test(pNum)) levels.push('Senior High School')
-    
-    // Context fallback
-    if (levels.length === 0) {
-       const context = t.substring(Math.max(0, match.index - 800), match.index + 800)
-       if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
-       if (/Elementary/i.test(context)) levels.push('Elementary')
-       if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
-       if (/Senior\s*High/i.test(context)) levels.push('Senior High School')
-    }
-
-    if (levels.includes('Senior High School')) {
-       strands = detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000))
-    }
-
-    permits.push({
-      permitNumber: pNum,
-      schoolYear: sYear,
-      levels: [...new Set(levels)],
-      strands: strands
-    })
-  }
-
-  // Strategy 2: Relaxed "No. ... s. Year" (fallback)
-  // Only if no strong matches, or to catch additional ones
-  // Must look like a structured ID (e.g., contains dashes or digits) to avoid false positives
-  const looseRegex = /(?:No\.?|Number)[\s:.]*([A-Z0-9-]{3,20})[\s,.]+(?:s\.)\s*(\d{4}(?:[-]\d{4})?)/gi
-  
-  while ((match = looseRegex.exec(t)) !== null) {
-      let pNum = cleanPermitNumber(match[1])
-      const sYear = match[2].trim()
-      
-      // Skip if already found
-      if (permits.some(p => p.permitNumber === pNum)) continue;
-
-      // Basic validation for loose match
-      // Must contain at least one digit or a hyphen to be considered a permit number
-      if (!/[\d-]/.test(pNum)) continue;
-
-      const levels = []
-      // Check prefix
-      if (/^K[-]/i.test(pNum)) levels.push('Kindergarten')
-      else if (/^E[-]/i.test(pNum)) levels.push('Elementary')
-      else if (/^S[-]/i.test(pNum) || /^JHS[-]/i.test(pNum)) levels.push('Junior High School') 
-      else if (/^SHS[-]/i.test(pNum)) levels.push('Senior High School')
-      
-      if (levels.length === 0) {
-          const context = t.substring(Math.max(0, match.index - 800), match.index + 800)
-          if (/Kindergarten/i.test(context)) levels.push('Kindergarten')
-          if (/Elementary/i.test(context)) levels.push('Elementary')
-          if (/Junior\s*High/i.test(context)) levels.push('Junior High School')
-          if (/Senior\s*High/i.test(context)) levels.push('Senior High School')
-      }
-
-      permits.push({
-          permitNumber: pNum,
-          schoolYear: sYear,
-          levels: [...new Set(levels)],
-          strands: levels.includes('Senior High School') ? detectStrands(t.substring(Math.max(0, match.index - 500), match.index + 2000)) : []
-      })
-  }
-
-  // Deduplicate permits by number + year
-  const uniquePermits = []
-  const seen = new Set()
-  permits.forEach(p => {
-      // Normalize year for dedupe (2024 -> 2024-2025? Optional, keeping raw for now)
-      const key = `${p.permitNumber}-${p.schoolYear}`
-      if (!seen.has(key)) {
-          seen.add(key)
-          uniquePermits.push(p)
-      }
-  })
-
-  return uniquePermits
-}
-
-async function onPermitFileChange(e) {
-  const file = e.target.files?.[0]
+async function onPermitFileChange(e: Event) {
+  const target = e.target as HTMLInputElement
+  const file = target.files?.[0]
   if (!file) return
   if (permitForm.value.filePreviewUrl) URL.revokeObjectURL(permitForm.value.filePreviewUrl)
   permitForm.value.file = file
   permitForm.value.filePreviewUrl = URL.createObjectURL(file)
   permitForm.value.fileName = file.name
-  permitFormErrors.value.upload = null
+  permitFormErrors.value.upload = ''
   permitForm.value.permitNumber = ''
   permitForm.value.extractedText = ''
   
   ocrLoading.value = true
   try {
-    let extractedPermits = []
+    let extractedPermits: any[] = []
     let fullText = ''
     
     if (file.type.startsWith('image/')) {
       const processedBlob = await preprocessImage(file)
-      const { data } = await Tesseract.recognize(processedBlob, 'eng')
-      fullText = data.text
+      const result = await Tesseract.recognize(processedBlob, 'eng')
+      fullText = result.data.text
       extractedPermits = extractPermitDetails(fullText)
     } else if (file.type === 'application/pdf') {
       const buf = await file.arrayBuffer()
@@ -1599,7 +1562,7 @@ async function onPermitFileChange(e) {
       for (let i = 1; i <= maxPages; i++) {
         const page = await pdf.getPage(i)
         const content = await page.getTextContent()
-        const rawText = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
+        const rawText = content.items.map((it: any) => ('str' in it ? it.str : '')).join(' ')
         let pageText = rawText
         
         const normalized = rawText.replace(/\s/g, '')
@@ -1610,17 +1573,21 @@ async function onPermitFileChange(e) {
              const viewport = page.getViewport({ scale: 2.0 })
              const canvas = document.createElement('canvas')
              const context = canvas.getContext('2d')
-             canvas.height = viewport.height
-             canvas.width = viewport.width
-             await page.render({ canvasContext: context, viewport: viewport }).promise
-             
-             applyImageEnhancement(context, viewport.width, viewport.height)
-             
-             const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))
-             const { data } = await Tesseract.recognize(blob, 'eng')
-             const ocrText = data.text || ''
-             if (ocrText.replace(/\s/g, '').length > normalized.length) {
-               pageText = ocrText
+             if (context) {
+               canvas.height = viewport.height
+               canvas.width = viewport.width
+               await (page as any).render({ canvasContext: context, viewport: viewport }).promise
+               
+               applyImageEnhancement(context, viewport.width, viewport.height)
+               
+               const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/png'))
+               if (blob) {
+                 const result = await Tesseract.recognize(blob, 'eng')
+                 const ocrText = result.data.text || ''
+                 if (ocrText.replace(/\s/g, '').length > normalized.length) {
+                   pageText = ocrText
+                 }
+               }
              }
            } catch (ocrErr) {
              console.error('Page OCR failed:', ocrErr)
@@ -1662,8 +1629,8 @@ async function onPermitFileChange(e) {
       }
     }
     
-  } catch (_) {
-    console.error(_)
+  } catch (err: any) {
+    console.error(err)
   } finally {
     ocrLoading.value = false
   }
@@ -1675,7 +1642,7 @@ const isHomeschooling = computed(() => {
 })
 
 function validatePermitForm() {
-  const err = {}
+  const err: Record<string, string> = {}
   if (!permitForm.value.schoolId) err.schoolId = 'Please select a school'
   if (!permitForm.value.levels?.length) err.levels = 'Select at least one level'
   if (!permitForm.value.schoolYear) {
@@ -1724,11 +1691,11 @@ function resetPermitForm() {
   permitFormErrors.value = {}
 }
 
-function checkSchoolNameMatch(text, schoolName) {
+function checkSchoolNameMatch(text: string | null | undefined, schoolName: string | null | undefined) {
   if (!text || !schoolName) return false
   
   // Normalize strings: lowercase, remove non-alphanumeric, remove common suffixes
-  const clean = (s) => {
+  const clean = (s: string) => {
     let str = s.toLowerCase()
     // Remove common suffixes to focus on the core name
     str = str.replace(/,\s*inc\.?$/g, '')
@@ -1748,7 +1715,7 @@ function checkSchoolNameMatch(text, schoolName) {
   if (t.includes(n)) return true
   
   // Fallback: Check if > 50% of words match
-  const normalizeWords = (s) => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/) 
+  const normalizeWords = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/) 
   const tWords = new Set(normalizeWords(text))
   const nWords = normalizeWords(schoolName).filter(w => w.length > 2 && !['inc', 'incorporated', 'city', 'laguna'].includes(w))
   
@@ -1760,17 +1727,17 @@ function checkSchoolNameMatch(text, schoolName) {
 
 const showConfirmation = ref(false)
 const confirmationMessage = ref('')
-const confirmationResolve = ref(null)
+const confirmationResolve = ref<((value: boolean) => void) | null>(null)
 
-function confirmAction(message) {
+function confirmAction(message: string): Promise<boolean> {
   confirmationMessage.value = message
   showConfirmation.value = true
-  return new Promise((resolve) => {
+  return new Promise<boolean>((resolve) => {
     confirmationResolve.value = resolve
   })
 }
 
-function handleConfirmation(result) {
+function handleConfirmation(result: boolean) {
   showConfirmation.value = false
   if (confirmationResolve.value) {
     confirmationResolve.value(result)
@@ -1778,8 +1745,8 @@ function handleConfirmation(result) {
   }
 }
 
-async function submitPermit() {
-  if (!validatePermitForm()) return
+async function submitPermit(): Promise<boolean> {
+  if (!validatePermitForm()) return false
   
   const formData = new FormData()
   const id = crypto.randomUUID?.() ?? Date.now().toString(36)
@@ -1801,18 +1768,12 @@ async function submitPermit() {
   }
 
   // Final check: Validate school name match if we have OCR text
-  // We don't have the full OCR text here easily unless we stored it. 
-  // But we have onPermitFileChange running it. 
-  // Let's assume validation is "soft" or handled during upload via toast.
-  // Actually user said "make sure", so let's enforce if we can.
-  // But we didn't store the full text. 
-  // Let's add fullText to permitForm to allow validation on submit.
   if (permitForm.value.extractedText && permitForm.value.schoolId) {
     const schoolName = getSchoolName(permitForm.value.schoolId)
     const match = checkSchoolNameMatch(permitForm.value.extractedText, schoolName)
     if (!match) {
       const confirmed = await confirmAction(`Warning: The school name "${schoolName}" was not found in the uploaded document. Continue anyway?`)
-      if (!confirmed) return
+      if (!confirmed) return false
     }
   }
 
@@ -1827,34 +1788,49 @@ async function submitPermit() {
       permits.value.push(savedPermit)
       resetPermitForm()
       showToast('Permit uploaded successfully!', 'success')
+      return true
     } else {
       const errData = await res.json().catch(() => ({}))
       throw new Error(errData.error || 'Failed to upload permit')
     }
-  } catch (error) {
+  } catch (error: any) {
     console.error(error)
     showToast(error.message || 'Error uploading permit', 'error')
+    return false
+  }
+}
+
+function addStrand() {
+  const s = window.prompt('Add Strand (e.g. STEM):')
+  if (s) {
+    permitForm.value.strands.push(s)
   }
 }
 
 // Toggle level in multi-select
-function toggleLevel(value) {
+function toggleLevel(value: string) {
   const i = permitForm.value.levels.indexOf(value)
   if (i >= 0) permitForm.value.levels.splice(i, 1)
   else permitForm.value.levels.push(value)
 }
 
-function toggleSchoolLevel(value) {
-  const i = schoolForm.value.levels.indexOf(value)
-  if (i >= 0) schoolForm.value.levels.splice(i, 1)
-  else schoolForm.value.levels.push(value)
-}
-
 // ─── Status logic ───────────────────────────────────────────────────────────
-function getStatus(schoolYear) {
+function getStatus(schoolYear: string | null | undefined, manualStatus?: string | null, levels: string[] = []) {
+  // If manual status is set, use it
+  if (manualStatus) {
+    if (manualStatus === 'Operational') return { label: 'Operational', color: 'green' }
+    if (manualStatus === 'For Renewal') return { label: 'For Renewal', color: 'yellow' }
+    if (manualStatus === 'Not Operational') return { label: 'Not Operational', color: 'red' }
+  }
+
+  // Senior High School permits do not have expiration dates, they are permanently Operational once issued
+  if (levels.includes('SHS')) {
+    return { label: 'Operational', color: 'green' }
+  }
+
   if (!schoolYear) return { label: 'Unknown', color: 'gray' }
   
-  let endYear = null
+  let endYear: number | null = null
   
   // Try to parse "YYYY-YYYY"
   const parts = schoolYear.split('-').map(p => parseInt(p.trim(), 10))
@@ -1887,7 +1863,7 @@ function getStatus(schoolYear) {
   expirationDate.setHours(0, 0, 0, 0)
   
   const msPerDay = 24 * 60 * 60 * 1000
-  const daysPast = Math.floor((now - expirationDate) / msPerDay)
+  const daysPast = Math.floor((now.getTime() - expirationDate.getTime()) / msPerDay)
   
   if (daysPast <= 0) {
     return { label: 'Operational', color: 'green' }
@@ -1900,7 +1876,7 @@ function getStatus(schoolYear) {
   }
 }
 
-function getStatusBadgeClass(status) {
+function getStatusBadgeClass(status: string | null | undefined) {
   if (!status) return 'bg-gray-50 text-gray-600 border-gray-200'
   if (status === 'Operational') return 'bg-green-50 text-green-700 border-green-200'
   if (status === 'For Renewal') return 'bg-yellow-50 text-yellow-700 border-yellow-200'
@@ -1908,11 +1884,11 @@ function getStatusBadgeClass(status) {
   return 'bg-gray-50 text-gray-600 border-gray-200'
 }
 
-function getOverallSchoolStatus(permits) {
+function getOverallSchoolStatus(permits: Permit[]) {
   if (!permits || permits.length === 0) return { label: 'No Records', color: 'gray' }
 
   // Helper to get end year for sorting
-  const getEndYear = (sy) => {
+  const getEndYear = (sy: string | null | undefined) => {
     if (!sy) return 0
     const parts = sy.split('-').map(p => parseInt(p.trim(), 10))
     if (parts.length === 2 && !isNaN(parts[1])) return parts[1]
@@ -1924,16 +1900,16 @@ function getOverallSchoolStatus(permits) {
   const sorted = [...permits].sort((a, b) => getEndYear(b.schoolYear) - getEndYear(a.schoolYear))
   
   // Return status of the latest permit
-  return getStatus(sorted[0].schoolYear)
+  return getStatus(sorted[0].schoolYear, sorted[0].manualStatus, sorted[0].levels)
 }
 
 
 
-function getSchoolType(schoolId) {
-  return schools.value.find((s) => s.id === schoolId)?.type ?? 'Private'
+function getSchoolType(schoolId: string) {
+  return schools.value.find((s: School) => s.id === schoolId)?.type ?? 'Private'
 }
 
-function openPreview(p) {
+function openPreview(p: Permit) {
   previewPermit.value = p
 }
 
@@ -1943,13 +1919,13 @@ function closePreview() {
 
 const isRenewingPermit = ref(false)
 
-function openRenewPermit(schoolId) {
+function openRenewPermit(schoolId: string) {
   resetPermitForm()
   permitForm.value.schoolId = schoolId
   isRenewingPermit.value = true
 }
 
-function downloadFile(permit) {
+function downloadFile(permit: Permit) {
   const url = permit.filePreviewUrl || `${API_URL.replace('/api', '')}/uploads/${permit.fileName}`
   const link = document.createElement('a')
   link.href = url
@@ -1965,28 +1941,32 @@ function closeSchoolDetails() {
 }
 
 // ─── Public Search: filtered results ────────────────────────────────────────
-const filterType = ref('All') // 'All' | 'Private' | 'Homeschooling'
+const filterType = ref<string>('All') // 'All' | 'Private' | 'Homeschooling'
 
 // ─── Base grouping for cards (used by search and default list) ──────────────
 const visibleSchoolLimit = ref(5)
 
-const groupedResults = computed(() => {
+const groupedResults = computed<GroupedSchool[]>(() => {
   const type = filterType.value
-  const grouped = {}
-  permits.value.forEach(p => {
-    if (!grouped[p.schoolId]) {
-      const s = schools.value.find(sc => sc.id === p.schoolId)
-      grouped[p.schoolId] = {
-        schoolId: p.schoolId,
+  const grouped: Record<string, GroupedSchool> = {}
+  permits.value.forEach((p: Permit) => {
+    const sId = p.schoolId || p.school_id || ''
+    if (!grouped[sId]) {
+      const s = schools.value.find((sc: School) => sc.id === sId)
+      grouped[sId] = {
+        schoolId: sId,
         schoolName: s ? s.name : 'Unknown',
         schoolAddress: s ? s.address : '',
         schoolType: s ? s.type : 'Private',
         latitude: s ? s.latitude : null,
         longitude: s ? s.longitude : null,
-        permits: []
+        status: '',
+        permits: [],
+        isDuplicateName: false,
+        branchIdentifier: ''
       }
     }
-    grouped[p.schoolId].permits.push(p)
+    grouped[sId].permits.push(p)
   })
   
   let results = Object.values(grouped)
@@ -1997,7 +1977,7 @@ const groupedResults = computed(() => {
   })
 
   // Handle Duplicate Names (Branch Detection)
-  const nameCounts = {}
+  const nameCounts: Record<string, number> = {}
   results.forEach(r => {
     const n = r.schoolName.trim().toLowerCase()
     nameCounts[n] = (nameCounts[n] || 0) + 1
@@ -2014,7 +1994,7 @@ const groupedResults = computed(() => {
   })
 
   if (type !== 'All') {
-    results = results.filter((g) => g.schoolType === type)
+    results = results.filter((g: GroupedSchool) => g.schoolType === type)
   }
   return results
 })
@@ -2029,7 +2009,7 @@ function loadMoreSchools() {
   visibleSchoolLimit.value += 5
 }
 
-watch(filterType, () => {
+watch(filterType, (newVal: string) => {
   visibleSchoolLimit.value = 5
 })
 
@@ -2039,7 +2019,7 @@ const searchResults = computed(() => {
   
   // Filter by query (school name)
   if (q) {
-    results = results.filter((g) => g.schoolName.toLowerCase().includes(q))
+    results = results.filter((g: GroupedSchool) => g.schoolName.toLowerCase().includes(q))
   }
   
   return results
@@ -2062,7 +2042,7 @@ const showEmptyState = computed(() => {
       leave-from-class="opacity-100"
       leave-to-class="opacity-0"
     >
-      <div
+      <button
         v-if="toast.show"
         class="fixed bottom-4 right-4 z-50 flex items-center gap-3 px-4 py-3 rounded-lg shadow-lg border"
         :class="toast.type === 'success' ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-red-50 border-red-200 text-red-800'"
@@ -2070,7 +2050,7 @@ const showEmptyState = computed(() => {
         <CheckCircle v-if="toast.type === 'success'" :size="20" />
         <XCircle v-else :size="20" />
         <span class="font-medium text-sm">{{ toast.message }}</span>
-      </div>
+      </button>
     </Transition>
 
     <!-- Header: shield + title + nav (matches mockup) ───────────────────────── -->
@@ -2287,14 +2267,14 @@ const showEmptyState = computed(() => {
                                 v-for="level in p.levels"
                                 :key="level"
                                 :class="{
-                                  'bg-emerald-100 text-emerald-800': getStatus(p.schoolYear).color === 'green',
-                                  'bg-amber-100 text-amber-800': getStatus(p.schoolYear).color === 'yellow',
-                                  'bg-red-100 text-red-800': getStatus(p.schoolYear).color === 'red',
-                                  'bg-gray-100 text-gray-800': getStatus(p.schoolYear).color === 'gray',
+                                  'bg-emerald-100 text-emerald-800': getStatus(p.schoolYear, p.manualStatus, p.levels).color === 'green',
+                                  'bg-amber-100 text-amber-800': getStatus(p.schoolYear, p.manualStatus, p.levels).color === 'yellow',
+                                  'bg-red-100 text-red-800': getStatus(p.schoolYear, p.manualStatus, p.levels).color === 'red',
+                                  'bg-gray-100 text-gray-800': getStatus(p.schoolYear, p.manualStatus, p.levels).color === 'gray',
                                 }"
                                 class="inline-flex items-center px-2.5 py-1 rounded-md text-sm font-medium"
                               >
-                                {{ level }}: {{ getStatus(p.schoolYear).label }}
+                                {{ level }}: {{ getStatus(p.schoolYear, p.manualStatus, p.levels).label }}
                               </span>
                             </div>
                             
@@ -3030,6 +3010,15 @@ const showEmptyState = computed(() => {
                         <input v-model="p.schoolYear" type="text" class="w-full px-2 py-1.5 rounded border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none text-sm bg-white" />
                       </div>
                     </div>
+                    <div class="mb-2">
+                      <label class="block text-xs font-medium text-slate-600 mb-1">Status Override (e.g. SHS Permanent)</label>
+                      <select v-model="p.manualStatus" class="w-full px-2 py-1.5 rounded border border-slate-300 focus:ring-2 focus:ring-sky-500 outline-none text-sm bg-white">
+                        <option :value="null">Automatic (Based on SY)</option>
+                        <option value="Operational">Operational</option>
+                        <option value="For Renewal">For Renewal</option>
+                        <option value="Not Operational">Not Operational</option>
+                      </select>
+                    </div>
                     <div>
                       <label class="block text-xs font-medium text-slate-600 mb-1">Levels</label>
                       <div class="flex flex-wrap gap-2">
@@ -3076,12 +3065,12 @@ const showEmptyState = computed(() => {
                 <div class="bg-white/90 backdrop-blur px-3 py-2 rounded-lg shadow-md flex items-center gap-4 text-xs text-slate-600 border border-slate-200">
                    <div class="flex items-center gap-1">
                       <span class="font-semibold">Lat:</span>
-                      <span class="font-mono">{{ editSchoolForm.latitude ? parseFloat(editSchoolForm.latitude).toFixed(6) : 'N/A' }}</span>
+                      <span class="font-mono">{{ editSchoolForm.latitude ? Number(editSchoolForm.latitude).toFixed(6) : 'N/A' }}</span>
                    </div>
                    <div class="w-px h-3 bg-slate-300"></div>
                    <div class="flex items-center gap-1">
                       <span class="font-semibold">Lng:</span>
-                      <span class="font-mono">{{ editSchoolForm.longitude ? parseFloat(editSchoolForm.longitude).toFixed(6) : 'N/A' }}</span>
+                      <span class="font-mono">{{ editSchoolForm.longitude ? Number(editSchoolForm.longitude).toFixed(6) : 'N/A' }}</span>
                    </div>
                    <div v-if="isGeocodingEdit" class="ml-auto flex items-center gap-2 text-sky-600">
                       <Loader2 class="w-3 h-3 animate-spin" />
@@ -3178,8 +3167,8 @@ const showEmptyState = computed(() => {
                   <div>
                     <div class="flex items-center gap-2 mb-1">
                       <span class="font-bold text-slate-800">{{ permit.schoolYear }}</span>
-                      <span :class="getStatusBadgeClass(getStatus(permit.schoolYear).label)" class="text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider">
-                        {{ getStatus(permit.schoolYear).label }}
+                      <span :class="getStatusBadgeClass(getStatus(permit.schoolYear, permit.manualStatus, permit.levels).label)" class="text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider">
+                        {{ getStatus(permit.schoolYear, permit.manualStatus, permit.levels).label }}
                       </span>
                     </div>
                     <p class="text-sm text-slate-600 mb-1">Permit No: <span class="font-medium">{{ permit.permitNumber }}</span></p>
@@ -3258,13 +3247,13 @@ const showEmptyState = computed(() => {
                 v-for="opt in levelOptions" 
                 :key="opt.value" 
                 class="flex items-center gap-2 p-2 rounded border cursor-pointer hover:bg-slate-50"
-                :class="editPermitForm.levels.includes(opt.value) ? 'border-sky-500 bg-sky-50' : 'border-slate-200'"
+                :class="editPermitForm.levels?.includes(opt.value) ? 'border-sky-500 bg-sky-50' : 'border-slate-200'"
               >
                 <input 
                   type="checkbox" 
                   :value="opt.value" 
                   class="rounded text-sky-600 focus:ring-sky-500"
-                  :checked="editPermitForm.levels.includes(opt.value)"
+                  :checked="editPermitForm.levels?.includes(opt.value)"
                   @change="toggleEditPermitLevel(opt.value)"
                 >
                 <span class="text-sm text-slate-700">{{ opt.label }}</span>
@@ -3382,7 +3371,7 @@ const showEmptyState = computed(() => {
                    {{ strand }}
                    <button @click="permitForm.strands.splice(idx, 1)" class="text-slate-400 hover:text-red-500"><XCircle :size="12"/></button>
                 </span>
-                <button class="text-xs text-sky-600 hover:underline px-2" @click="() => { const s = prompt('Add Strand (e.g. STEM):'); if(s) permitForm.strands.push(s) }">+ Add</button>
+                <button class="text-xs text-sky-600 hover:underline px-2" @click="addStrand">+ Add</button>
              </div>
           </div>
         </div>
