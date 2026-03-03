@@ -244,6 +244,9 @@ async function saveEditSchool() {
         formData.append('schoolYear', p.schoolYear)
         formData.append('permitNumber', p.permitNumber)
         formData.append('extractedText', p.extractedText || '')
+        if ((p as any).manualStatus !== undefined) {
+          formData.append('manualStatus', (p as any).manualStatus ?? '')
+        }
         await fetch(`${API_URL}/permits/${p.id}`, {
           method: 'PUT',
           body: formData
@@ -251,7 +254,16 @@ async function saveEditSchool() {
       }
       showToast('School and permits updated', 'success')
       isEditingSchool.value = false
-      refreshData()
+      const savedSchoolId = editSchoolForm.value.id
+      await refreshData()
+      // Re-sync selectedSchool with the freshly loaded data so the
+      // Details modal reflects the saved changes immediately (e.g. status change)
+      if (selectedSchool.value && selectedSchool.value.schoolId === savedSchoolId) {
+        const updated = groupedResults.value.find((g: GroupedSchool) => g.schoolId === savedSchoolId)
+        if (updated) {
+          selectedSchool.value = updated
+        }
+      }
     } else {
       throw new Error('Failed to update')
     }
@@ -429,7 +441,15 @@ async function saveEditPermit() {
     if (res.ok) {
       showToast('Permit updated successfully', 'success')
       isEditingPermit.value = false
-      refreshData()
+      const savedSchoolId = editPermitForm.value.schoolId
+      await refreshData()
+      // Re-sync selectedSchool so the Details modal reflects permit changes immediately
+      if (selectedSchool.value && selectedSchool.value.schoolId === savedSchoolId) {
+        const updated = groupedResults.value.find((g: GroupedSchool) => g.schoolId === savedSchoolId)
+        if (updated) {
+          selectedSchool.value = updated
+        }
+      }
     } else {
       throw new Error('Failed to update')
     }
@@ -1785,9 +1805,19 @@ async function submitPermit(): Promise<boolean> {
     
     if (res.ok) {
       const savedPermit = await res.json()
+      // Capture schoolId before resetPermitForm clears the form
+      const renewedSchoolId = permitForm.value.schoolId
       permits.value.push(savedPermit)
       resetPermitForm()
       showToast('Permit uploaded successfully!', 'success')
+      // Re-sync selectedSchool so the Details modal reflects the new permit immediately
+      if (selectedSchool.value && selectedSchool.value.schoolId === renewedSchoolId) {
+        await nextTick()
+        const updated = groupedResults.value.find((g: GroupedSchool) => g.schoolId === renewedSchoolId)
+        if (updated) {
+          selectedSchool.value = updated
+        }
+      }
       return true
     } else {
       const errData = await res.json().catch(() => ({}))
@@ -2932,7 +2962,7 @@ const showEmptyState = computed(() => {
     </div>
 
     <!-- Edit School Modal -->
-    <div v-if="isEditingSchool" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div v-if="isEditingSchool" class="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
       <div class="bg-white rounded-xl shadow-xl w-full max-w-5xl overflow-hidden animate-in zoom-in-95 duration-200 flex flex-col max-h-[90vh]">
         <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 shrink-0">
           <h3 class="font-bold text-slate-800 text-lg">Edit School</h3>
